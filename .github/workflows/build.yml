@@ -1,0 +1,118 @@
+name: build
+
+# Builds only when you start them: Actions tab -> build -> Run workflow (choose the main branch to also make a release).
+# Pushes and pull requests no longer start a build by themselves.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# one build at a time, so two builds never pick the same version
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # NVIDIA's DLSS SDK (headers + static library), from NVIDIA's own public repository, pinned to one commit.
+      # If this step fails the host is built without DLSS (the host's log then says so).
+      - name: Fetch NVIDIA DLSS SDK
+        shell: pwsh
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $c = '374959484e79a640feaba44c93ac8cfb0a03f5b5'
+          New-Item -ItemType Directory -Force third_party/ngx/include, third_party/ngx/lib | Out-Null
+          $files = @{
+            'include/nvsdk_ngx.h' = 'include'; 'include/nvsdk_ngx_defs.h' = 'include'; 'include/nvsdk_ngx_defs_dlssd.h' = 'include'
+            'include/nvsdk_ngx_helpers.h' = 'include'; 'include/nvsdk_ngx_helpers_dlssd.h' = 'include'; 'include/nvsdk_ngx_params.h' = 'include'
+            'lib/Windows_x86_64/x64/nvsdk_ngx_s.lib' = 'lib'
+          }
+          $hdr = @{ Accept = 'application/vnd.github.raw'; Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'opticapturehost-ci' }
+          foreach ($f in $files.Keys) {
+            $out = "third_party/ngx/$($files[$f])/$(Split-Path $f -Leaf)"
+            try {
+              Invoke-WebRequest "https://api.github.com/repos/NVIDIA/DLSS/contents/$($f)?ref=$c" -Headers $hdr -OutFile $out
+            } catch { Write-Host "::warning::contents API failed for $f : $_" }
+            # a Git LFS pointer instead of the file: take the real one from the LFS media server
+            $isPointer = (Test-Path $out) -and ((Get-Item $out).Length -lt 400) -and ((Get-Content $out -TotalCount 1) -like 'version https://git-lfs*')
+            if (-not (Test-Path $out) -or $isPointer) {
+              try { Invoke-WebRequest "https://media.githubusercontent.com/media/NVIDIA/DLSS/$c/$f" -OutFile $out }
+              catch { Write-Host "::warning::could not fetch $f : $_" }
+            }
+          }
+          Get-ChildItem -Recurse third_party/ngx -File | ForEach-Object { Write-Host "$($_.FullName)  $($_.Length)" }
+          if (-not (Test-Path third_party/ngx/lib/nvsdk_ngx_s.lib) -or (Get-Item third_party/ngx/lib/nvsdk_ngx_s.lib).Length -lt 100000 -or -not (Test-Path third_party/ngx/include/nvsdk_ngx.h)) {
+            Write-Host "::warning::DLSS SDK files are missing or invalid; building without DLSS"
+            Remove-Item -Recurse -Force third_party/ngx -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+      # On main every build gets a NEW version: the patch number is raised past the highest release that already exists
+      # (v2.10.70 -> v2.10.71 ...), written into src/version.h of this build only, so the exe, the launcher and the release all show it.
+      # Older releases are never touched.
+      - name: Pick the next version
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = '${{ github.repository }}'
+          $h = Get-Content src/version.h -Raw
+          $major = [int][regex]::Match($h, '#define OC_VER_MAJOR (\d+)').Groups[1].Value
+          $minor = [int][regex]::Match($h, '#define OC_VER_MINOR (\d+)').Groups[1].Value
+          $patch = [int][regex]::Match($h, '#define OC_VER_PATCH (\d+)').Groups[1].Value
+          $tags = @()
+          try { $tags = (gh api --paginate "repos/$repo/releases?per_page=100" | ConvertFrom-Json) | ForEach-Object { $_.tag_name } } catch { Write-Host "::warning::could not list releases: $_" }
+          $max = -1
+          foreach ($t in $tags) {
+            $m = [regex]::Match($t, "^v$major\.$minor\.(\d+)$")
+            if ($m.Success -and [int]$m.Groups[1].Value -gt $max) { $max = [int]$m.Groups[1].Value }
+          }
+          if ($patch -le $max) { $patch = $max + 1 }
+          $ver = "$major.$minor.$patch"
+          Write-Host "Version of this build: $ver (highest existing release patch: $max)"
+          $h = [regex]::Replace($h, '#define OC_VER_PATCH \d+', "#define OC_VER_PATCH $patch")
+          $h = [regex]::Replace($h, '#define OC_VER_STR "[^"]+"', "#define OC_VER_STR `"$ver`"")
+          Set-Content src/version.h $h -NoNewline
+          "OC_BUILD_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/OptiCaptureHost.exe dist/
+          Copy-Item build/Release/OptiCaptureLauncher.exe dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath OptiCaptureHost-win64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OptiCaptureHost
+          path: dist
+
+      # Every build on main makes a NEW release (tag v<version>); older releases are never deleted or replaced.
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = $env:OC_BUILD_VERSION
+          if (-not $ver) { Write-Host "::error::no version was picked"; exit 1 }
+          $tag = "v$ver"
+          Copy-Item OptiCaptureHost-win64.zip "OptiCaptureHost-$ver-win64.zip"
+          gh release create $tag "OptiCaptureHost-$ver-win64.zip" --title "OptiCaptureHost $ver" --notes "Automatic build of commit ${{ github.sha }}." --target ${{ github.sha }} --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
