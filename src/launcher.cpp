@@ -57,7 +57,7 @@ constexpr const wchar_t* kOverlayClass = L"OptiCaptureHostOverlay"; // the host'
 constexpr const wchar_t* kVersion = L"" OC_VER_STR;
 
 constexpr float kW = 796.0f; // client size in logical pixels (scaled by the DPI)
-constexpr float kH = 770.0f;
+constexpr float kH = 812.0f;
 
 constexpr UINT_PTR kTimerList = 1;
 constexpr UINT_PTR kTimerHost = 2;
@@ -3850,7 +3850,7 @@ void App::Paint(HDC dc, int W, int H)
     }
 
     // ---- games card ----
-    const gp::RectF left = R(24, 100, 500, 718);
+    const gp::RectF left = R(24, 100, 500, 766);
     Card(g, left);
     Text(g, L"Choose a game", *f_.h2, R(44, 112, 300, 24), col::Text());
     Text(g, L"Pick the window of the game you want to enhance", *f_.sm, R(44, 136, 340, 18), col::Muted());
@@ -4192,7 +4192,7 @@ void App::Paint(HDC dc, int W, int H)
 
     // ---- shortcuts card ----
     {
-        const gp::RectF c = R(540, 380, 372, 432);
+        const gp::RectF c = R(540, 380, 372, 480);
         Card(g, c);
         Text(g, L"Shortcuts", *f_.h2, R(560, 576, 200, 24), col::Text());
 
@@ -4307,8 +4307,8 @@ void App::Paint(HDC dc, int W, int H)
             Text(g, pictureOn_ ? L"On" : L"Off", *f_.bodyB, R(800, 538, 92, 22), pictureOn_ ? col::Green() : col::Muted(), 2);
         }
 
-        float y = 602.0f;
-        for (int i = 0; i < kScCount; ++i, y += 30.0f)
+        float y = 606.0f;
+        for (int i = 0; i < kScCount; ++i, y += 36.0f)
         {
             if (i > 0)
             {
@@ -4316,40 +4316,40 @@ void App::Paint(HDC dc, int W, int H)
                 g.DrawLine(&sep, S(560), S(y - 1), S(892), S(y - 1));
             }
 
-            Text(g, kShortcutDefs[i].label, *f_.body, R(560, y + 1, 150, 18), col::Text());
-            Text(g, kShortcutDefs[i].hint, *f_.tiny, R(560, y + 17, 176, 14), col::Muted());
+            Text(g, kShortcutDefs[i].label, *f_.body, R(560, y + 2, 150, 18), col::Text());
+            Text(g, kShortcutDefs[i].hint, *f_.tiny, R(560, y + 20, 176, 14), col::Muted());
 
             if (i == kScFgKey)
             {
                 // ON / OFF badge: this key switches frame generation on and off
-                const gp::RectF badge = R(680, y + 3, 52, 18);
+                const gp::RectF badge = R(680, y + 4, 52, 18);
                 FillRound(g, badge, S(9), col::Alpha(col::Green(), 36));
                 StrokeRound(g, badge, S(9), col::Alpha(col::Green(), 130), max(1.0f, S(1)));
                 Text(g, L"ON/OFF", *f_.tiny, badge, col::Green(), 1);
             }
 
-            Chip(g, R(742, y + 3, 150, 25), ChipText(i), kIdShortcut0 + i, capturing_ == i);
+            Chip(g, R(742, y + 5, 150, 26), ChipText(i), kIdShortcut0 + i, capturing_ == i);
         }
 
         // Two more shortcuts that always work while the capture host runs (fixed, not changeable here).
         {
             gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
-            g.DrawLine(&sep, S(560), S(y + 1), S(892), S(y + 1));
-            Text(g, L"Ctrl+Shift+F10", *f_.tiny, R(560, y + 3, 100, 13), col::Accent());
-            Text(g, L"Focus the overlay and open the OptiScaler menu", *f_.tiny, R(660, y + 3, 240, 13), col::Muted());
-            Text(g, L"Ctrl+Shift+F11", *f_.tiny, R(560, y + 16, 100, 13), col::Accent());
-            Text(g, L"Switch mouse and keyboard: game / overlay", *f_.tiny, R(660, y + 16, 240, 13), col::Muted());
+            g.DrawLine(&sep, S(560), S(y + 2), S(892), S(y + 2));
+            Text(g, L"Ctrl+Shift+F10", *f_.tiny, R(560, y + 6, 100, 14), col::Accent());
+            Text(g, L"Focus overlay, open OptiScaler menu", *f_.tiny, R(668, y + 6, 224, 14), col::Muted());
+            Text(g, L"Ctrl+Shift+F11", *f_.tiny, R(560, y + 23, 100, 14), col::Accent());
+            Text(g, L"Mouse + keyboard: game / overlay", *f_.tiny, R(668, y + 23, 224, 14), col::Muted());
         }
     }
 
     // ---- footer ----
     {
         gp::Pen line(col::Line(), max(1.0f, S(1)));
-        g.DrawLine(&line, S(24), S(822), S(912), S(822));
+        g.DrawLine(&line, S(24), S(870), S(912), S(870));
 
         // Links panel: a framed card with four chips (icon, small label, value).
         {
-            const gp::RectF panel = R(24, 856, 626, 42);
+            const gp::RectF panel = R(24, 904, 626, 42);
             Card(g, panel);
             struct LinkChip { const wchar_t* label; const wchar_t* value; float x; float w; int id; bool heart; };
             static const LinkChip chips[] = {
@@ -4360,17 +4360,17 @@ void App::Paint(HDC dc, int W, int H)
             };
             for (const LinkChip& c : chips)
             {
-                const gp::RectF chip = R(c.x, 860, c.w, 34);
+                const gp::RectF chip = R(c.x, 908, c.w, 34);
                 const bool hot = hover_ == c.id;
                 const gp::Color tone = col::Accent();
                 FillRound(g, chip, S(9), hot ? col::Alpha(tone, 46) : col::Row());
                 StrokeRound(g, chip, S(9), hot ? tone : col::Line(), max(1.0f, S(1)));
                 if (c.heart)
-                    DrawGithubMark(g, R(c.x + 8, 866, 22, 22), hot ? col::Accent2() : col::Text());
+                    DrawGithubMark(g, R(c.x + 8, 914, 22, 22), hot ? col::Accent2() : col::Text());
                 else
-                    DrawPlane(g, R(c.x + 8, 866, 22, 22));
-                Text(g, c.label, *f_.tiny, R(c.x + 36, 862, c.w - 40, 14), col::Muted());
-                Text(g, c.value, hot ? *f_.link : *f_.linkN, R(c.x + 36, 874, c.w - 40, 18), hot ? col::Accent2() : tone);
+                    DrawPlane(g, R(c.x + 8, 914, 22, 22));
+                Text(g, c.label, *f_.tiny, R(c.x + 36, 910, c.w - 40, 14), col::Muted());
+                Text(g, c.value, hot ? *f_.link : *f_.linkN, R(c.x + 36, 922, c.w - 40, 18), hot ? col::Accent2() : tone);
                 AddHit(chip, c.id);
             }
         }
@@ -4396,10 +4396,10 @@ void App::Paint(HDC dc, int W, int H)
         {
             status = L"Pick a game from the list to begin.";
         }
-        Text(g, status, *f_.sm, R(24, 828, 640, 28), tone, 0, true);
+        Text(g, status, *f_.sm, R(24, 876, 640, 28), tone, 0, true);
 
         const bool noPick = !running && (selected_ < 0 || selected_ >= static_cast<int>(games_.size()));
-        Button(g, R(672, 852, 240, 46), running ? (stopping_ ? L"STOPPING\u2026" : L"STOP") : L"START", noPick, running);
+        Button(g, R(672, 900, 240, 46), running ? (stopping_ ? L"STOPPING\u2026" : L"STOP") : L"START", noPick, running);
     }
 
     // ---- warning dialog (on top of everything) ----
