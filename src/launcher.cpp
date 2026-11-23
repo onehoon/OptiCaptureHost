@@ -1431,6 +1431,7 @@ class App
     static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM w, LPARAM l);
     LRESULT OnPanelMessage(UINT m, WPARAM w, LPARAM l);
     bool CreatePanel();
+    bool lastHave_ = false; // the dll was found at the last look (decides the height of the DLSS 5 window)
     bool panelOpen_ = false; // the DLSS 5 window is shown (header button "DLSS 5")
     void DockPanel();
     void PaintPanel(HDC dc, int w, int h);
@@ -2921,7 +2922,7 @@ void App::OnClick(int id)
             st_ = oc::Settings();
             st_.presentDelay = 0;  // reset values: no present delay,
             st_.presentMode = 0;   // Auto present mode,
-            st_.upscalerMode = 1;  // AMD FSR 3.1.5
+            st_.upscalerMode = 1;  // AMD FSR 3.1.6
             st_.optiFps = 0;       // "OptiScaler fps = Hz" unchecked,
             vsyncMode_ = 0;        // VSync off
             Save();
@@ -3388,7 +3389,7 @@ void App::OnClick(int id)
             AppendMenuW(menu, MF_STRING | (st_.upscalerMode == 0 ? MF_CHECKED : 0),
                 kUpscalerMenuBase + 0, L"Intel XeSS");
             AppendMenuW(menu, MF_STRING | (st_.upscalerMode == 1 ? MF_CHECKED : 0),
-                kUpscalerMenuBase + 1, L"AMD FSR 3.1.5");
+                kUpscalerMenuBase + 1, L"AMD FSR 3.1.6");
             AppendMenuW(menu, MF_STRING | (st_.upscalerMode == 2 ? MF_CHECKED : 0),
                 kUpscalerMenuBase + 2, L"NVIDIA DLSS");
             AppendMenuW(menu, MF_STRING | (st_.upscalerMode == 3 ? MF_CHECKED : 0),
@@ -3431,12 +3432,12 @@ void App::OnClick(int id)
                     L"Upscalers", L"Dx12Upscaler",
                     values[st_.upscalerMode], iniPath.c_str()))
             {
-                // FSR 3.1.5: FSR upscaler index 2 (the comment in OptiScaler.ini about the indexes is out of date). FSR 4.1.2: automatic index, plus sharpness, CAS and the native upscaler pass.
+                // FSR 3.1.6: FSR upscaler index 2 (the comment in OptiScaler.ini about the indexes is out of date). FSR 4.1.2: automatic index, plus sharpness, CAS and the native upscaler pass.
                 if (st_.upscalerMode == 3) // DLSS 3.7 (runs on the FSR upscaler): index 1
                 {
                     WritePrivateProfileStringW(L"FSR", L"UpscalerIndex", L"1", iniPath.c_str());
                 }
-                else if (st_.upscalerMode == 1 || st_.upscalerMode == 5) // FSR 3.1.5 and DittoSR: index 2
+                else if (st_.upscalerMode == 1 || st_.upscalerMode == 5) // FSR 3.1.6 and DittoSR: index 2
                 {
                     WritePrivateProfileStringW(L"FSR", L"UpscalerIndex", L"2", iniPath.c_str());
                 }
@@ -3449,7 +3450,7 @@ void App::OnClick(int id)
                     WritePrivateProfileStringW(L"DlssNr", L"NativeUpscalerPass", L"true", iniPath.c_str());
                 }
 
-                // FSR 3.1.5, FSR 4.1.2 and DLSS 3.7: also put the ready-made DLL set of that folder into the MK-JH folder.
+                // FSR 3.1.6, FSR 4.1.2 and DLSS 3.7: also put the ready-made DLL set of that folder into the MK-JH folder.
                 if (st_.upscalerMode == 1 || st_.upscalerMode == 3 || st_.upscalerMode == 4 || st_.upscalerMode == 5)
                 {
                     const bool ditto = st_.upscalerMode == 5;
@@ -3525,8 +3526,9 @@ void App::OnClick(int id)
 
 namespace
 {
-constexpr float kPanelW = 250.0f; // logical units, like the main window (see S / R)
-constexpr float kPanelH = 520.0f;
+constexpr float kPanelW = 270.0f; // logical units, like the main window (see S / R)
+constexpr float kPanelHHave = 446.0f;    // dll found: shorter
+constexpr float kPanelHMissing = 556.0f; // dll missing: warning, download button and a hint more
 constexpr float kPanelDrop = 90.0f; // how far below the top of the main window the DLSS 5 window starts
 } // namespace
 
@@ -3556,7 +3558,7 @@ bool App::CreatePanel()
 
     // An owned popup: it stays above the main window, and hides / shows with it (minimise, restore).
     panel_ = CreateWindowExW(WS_EX_TOOLWINDOW, kPanelClass, L"DLSS 5", WS_POPUP, 0, 0, static_cast<int>(S(kPanelW)),
-                             static_cast<int>(S(kPanelH)), hwnd_, nullptr, inst_, this);
+                             static_cast<int>(S(kPanelHMissing)), hwnd_, nullptr, inst_, this);
     if (!panel_)
         return false;
 
@@ -3576,7 +3578,8 @@ void App::DockPanel()
     RECT r{};
     GetWindowRect(hwnd_, &r);
     const int pw = static_cast<int>(S(kPanelW));
-    const int ph = static_cast<int>(S(kPanelH));
+    lastHave_ = DlssnrPresent();
+    const int ph = static_cast<int>(S(lastHave_ ? kPanelHHave : kPanelHMissing));
 
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
@@ -3622,67 +3625,74 @@ void App::PaintPanel(HDC dc, int W, int H)
         g.DrawRectangle(&border, 0.0f, 0.0f, static_cast<float>(W) - 1.0f, static_cast<float>(H) - 1.0f);
     }
 
-    Text(g, L"DLSS 5", *f_.title, R(18, 14, 214, 34), col::Text());
-    Text(g, L"Optional  ·  needs nvngx_dlssnr.dll", *f_.sm, R(18, 50, 222, 18), col::Muted());
+    // header
+    Text(g, L"DLSS 5", *f_.title, R(18, 14, 234, 34), col::Text());
+    Text(g, L"Optional  \u00b7  needs nvngx_dlssnr.dll", *f_.sm, R(18, 50, 240, 18), col::Muted());
+    auto sepAt = [&](float yy)
     {
         gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
-        g.DrawLine(&sep, S(18), S(78), S(232), S(78));
-    }
+        g.DrawLine(&sep, S(18), S(yy), S(252), S(yy));
+    };
+    sepAt(80);
 
-    // enable / disable: shows what OptiScaler.ini says ([DlssNr] Enabled = true)
+    // enable / disable: a switch that shows what OptiScaler.ini says ([DlssNr] Enabled = true)
     {
-        const gp::RectF box = R(18, 94, 18, 18);
         const bool hot = hover_ == kIdD5Enable;
-        FillRound(g, box, S(5), dlss5On_ ? col::Accent() : col::Row());
-        StrokeRound(g, box, S(5), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
-        if (dlss5On_)
-            Text(g, L"\u2713", *f_.chip, box, col::White(), 1);
-        Text(g, L"Enable DLSS 5", *f_.bodyB, R(44, 92, 150, 22), col::Text());
-        Text(g, dlss5On_ ? L"On" : L"Off", *f_.bodyB, R(180, 92, 52, 22), dlss5On_ ? col::Green() : col::Muted(), 2);
-        AddHit(R(18, 88, 214, 30), kIdD5Enable);
+        Text(g, L"Enable DLSS 5", *f_.bodyB, R(18, 96, 180, 26), col::Text());
+        const gp::RectF track = R(208, 96, 44, 24);
+        FillRound(g, track, S(12), dlss5On_ ? col::Accent() : col::Row());
+        StrokeRound(g, track, S(12), dlss5On_ ? col::Accent2() : (hot ? col::Accent() : col::Line()), max(1.0f, S(1.5f)));
+        gp::SolidBrush knob(dlss5On_ ? col::White() : col::Muted());
+        const float kr = S(8);
+        const float kx = dlss5On_ ? track.X + track.Width - S(13) : track.X + S(13);
+        g.FillEllipse(&knob, kx - kr, track.Y + track.Height / 2 - kr, kr * 2, kr * 2);
+        Text(g, dlss5On_ ? L"On: [DlssNr] Enabled = true" : L"Off: [DlssNr] Enabled = auto", *f_.tiny, R(18, 124, 234, 14),
+             dlss5On_ ? col::Green() : col::Muted());
+        AddHit(R(18, 90, 234, 52), kIdD5Enable);
     }
-
-    {
-        gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
-        g.DrawLine(&sep, S(18), S(130), S(232), S(130));
-    }
+    sepAt(150);
 
     // the file DLSS 5 needs, next to the program
-    float y = 142.0f;
+    float y = 162.0f;
     {
         const bool have = DlssnrPresent();
-        Text(g, L"Required file", *f_.bodyB, R(18, y, 214, 22), col::Text());
-        Text(g, kDlssnrFile, *f_.sm, R(18, y + 24, 214, 18), col::Muted());
-        y += 50.0f;
-        if (have)
+        Text(g, L"Required file", *f_.bodyB, R(18, y, 234, 22), col::Text());
+        y += 28.0f;
+        const gp::RectF box = R(18, y, 234, 58);
+        FillRound(g, box, S(10), col::Row());
+        StrokeRound(g, box, S(10), have ? col::Alpha(col::Green(), 130) : col::Alpha(col::Red(), 150), max(1.0f, S(1)));
+        Text(g, kDlssnrFile, *f_.sm, R(30, y + 7, 214, 18), col::Muted());
+        Text(g, have ? L"\u2713  Found next to the program" : L"\u2717  Not found next to the program", *f_.bodyB, R(30, y + 28, 216, 22),
+             have ? col::Green() : col::Red());
+        y += 70.0f;
+        if (!have)
         {
-            Text(g, L"\u2713  Found next to the program", *f_.bodyB, R(18, y, 218, 22), col::Green());
+            Text(g, L"DLSS 5 will not work without it.", *f_.sm, R(18, y, 234, 18), col::Red());
             y += 26.0f;
-        }
-        else
-        {
-            Text(g, L"\u2717  Not found next to the program", *f_.bodyB, R(18, y, 218, 22), col::Red());
-            Text(g, L"DLSS 5 will not work without it.", *f_.sm, R(18, y + 24, 218, 18), col::Red());
-            y += 50.0f;
 
-            const gp::RectF link = R(18, y, 214, 22);
+            const gp::RectF link = R(18, y, 234, 32);
             const bool hot = hover_ == kIdD5Download;
-            Text(g, L"Download nvngx_dlssnr.dll", hot ? *f_.link : *f_.linkN, link, hot ? col::Accent2() : col::Accent());
+            FillRound(g, link, S(9), hot ? col::Accent2() : col::Accent());
+            StrokeRound(g, link, S(9), col::Line(), max(1.0f, S(1)));
+            Text(g, L"Download nvngx_dlssnr.dll", *f_.chip, link, col::White(), 1);
             AddHit(link, kIdD5Download);
-            y += 26.0f;
-            Text(g, L"Download it and place it exactly next to the program.", *f_.sm, R(18, y, 218, 36), col::Muted(), 0, true);
+            y += 40.0f;
+            Text(g, L"Download it and place it exactly next to the program.", *f_.sm, R(18, y, 234, 36), col::Muted(), 0, true);
             y += 44.0f;
         }
-        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.sm, R(18, y, 218, 18), col::Muted());
+        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.sm, R(18, y, 234, 18), col::Muted());
         y += 30.0f;
     }
+    sepAt(y);
 
+    // where the DLSS 5 settings are
     {
-        gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
-        g.DrawLine(&sep, S(18), S(y), S(232), S(y));
-        Text(g, L"DLSS 5 settings", *f_.bodyB, R(18, y + 10, 214, 22), col::Text());
+        Text(g, L"DLSS 5 settings", *f_.bodyB, R(18, y + 12, 234, 22), col::Text());
+        const gp::RectF box = R(18, y + 40, 234, 96);
+        FillRound(g, box, S(10), col::Alpha(col::Accent(), 24));
+        StrokeRound(g, box, S(10), col::Alpha(col::Accent(), 90), max(1.0f, S(1)));
         Text(g, L"In the game, open the OptiScaler menu and go to the Neural Rendering section to change the settings you want.",
-             *f_.sm, R(18, y + 36, 218, 110), col::Text(), 0, true);
+             *f_.sm, R(28, y + 48, 216, 82), col::Text(), 0, true);
     }
 
     hits2_.swap(hits_);
@@ -3704,6 +3714,8 @@ LRESULT App::OnPanelMessage(UINT m, WPARAM w, LPARAM l)
         // look at OptiScaler.ini and at the dll again (they may have been changed by hand)
         if (ReadFgState())
             Invalidate();
+        if (DlssnrPresent() != lastHave_)
+            DockPanel(); // the window gets shorter / taller
         InvalidatePanel();
         return 0;
 
@@ -4573,7 +4585,7 @@ void App::Paint(HDC dc, int W, int H)
         {
             static const wchar_t* upscalerNames[] = {
                 L"Intel XeSS",
-                L"AMD FSR 3.1.5",
+                L"AMD FSR 3.1.6",
                 L"NVIDIA DLSS",
                 L"DLSS 3.7  (AMD / GTX 16)",
                 L"AMD FSR 4.1.2",

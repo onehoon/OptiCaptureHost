@@ -65,7 +65,7 @@ The project has two programs:
 
   Levels: **Native (1x)**, **Quality (1.5x)**, **Balanced (1.7x)**, **Performance (2x)**.
 - **The host measures motion itself.** A window capture has no motion vectors, so the host estimates them from consecutive frames on the GPU (block matching, sub-pixel refinement, temporal steadiness, a reactive mask).
-- **Opti Upscaler selector** — FSR 3.1.5, FSR 4.1.2, DLSS 3.7, DittoSR, XeSS, DLSS; picking one writes `OptiScaler.ini` and copies that upscaler's folder next to the exes.
+- **Opti Upscaler selector** — FSR 3.1.6, FSR 4.1.2, DLSS 3.7, DittoSR, XeSS, DLSS; picking one writes `OptiScaler.ini` and copies that upscaler's folder next to the exes.
 - Built-in frame limiter, low-latency present modes, VSync on/off/auto, configurable hotkeys, live status panel.
 
 ## Requirements
