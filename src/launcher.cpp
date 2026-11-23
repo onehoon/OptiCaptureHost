@@ -72,13 +72,13 @@ constexpr int kIdLinkApps = 9;
 constexpr int kIdLinkArchive = 10;
 constexpr int kIdLinkGithub = 50;
 constexpr int kIdD5Enable = 70;   // DLSS 5 side window: enable / disable
-constexpr int kIdD5Preset = 71;   // DLSS 5 side window: preset selector
+constexpr int kIdHudFix = 73;     // tick box: [OptiFG] HUDFix
+constexpr int kIdAsyncFg = 74;    // tick box: [FSRFG] AllowAsync
 constexpr int kIdD5Download = 72; // DLSS 5 side window: download link for nvngx_dlssnr.dll
-constexpr int kD5PresetMenuBase = 5400;
 constexpr const wchar_t* kPanelClass = L"OptiCaptureLauncherDlss5";
 constexpr const wchar_t* kDlssnrFile = L"nvngx_dlssnr.dll";
 // Where users download nvngx_dlssnr.dll (to be filled in; empty = the window says the link is not set yet).
-constexpr const wchar_t* kDlssnrUrl = L"";
+constexpr const wchar_t* kDlssnrUrl = L"https://t.me/MKJH_ARCHIVE/352";
 constexpr int kIdOptiFps = 51; // OptiScaler FPS limit = monitor refresh rate
 constexpr int kIdMfg0 = 60; // 60..64: multi frame generation 2x / 3x / 4x / 5x / 6x
 constexpr int kFgMenuBase = 5000;
@@ -349,37 +349,6 @@ struct GameItem
 
 // The OptiScaler.ini lines the DLSS 5 window writes. Filled in as the settings are decided:
 // { section, key, value }. Nothing is written for an empty list.
-struct IniEntry
-{
-    const wchar_t* section;
-    const wchar_t* key;
-    const wchar_t* value;
-};
-
-struct Dlss5Preset
-{
-    const wchar_t* name;
-    std::vector<IniEntry> ini; // written when this preset is chosen and DLSS 5 is enabled
-};
-
-inline const std::vector<IniEntry>& Dlss5IniOn()  // written when DLSS 5 is enabled
-{
-    static const std::vector<IniEntry> v = {};
-    return v;
-}
-
-inline const std::vector<IniEntry>& Dlss5IniOff() // written when DLSS 5 is disabled
-{
-    static const std::vector<IniEntry> v = {};
-    return v;
-}
-
-inline const std::vector<Dlss5Preset>& Dlss5Presets()
-{
-    static const std::vector<Dlss5Preset> v = { { L"Default", {} } };
-    return v;
-}
-
 struct Hit
 {
     gp::RectF r;
@@ -1635,29 +1604,41 @@ class App
         const std::wstring v = st_.mfgCount == 0 ? std::wstring(L"auto") : std::to_wstring(st_.mfgCount);
         WritePrivateProfileStringW(st_.frameGenMode == 0 ? L"XeFG" : L"DLSSG", L"InterpolationCount", v.c_str(), ini.c_str());
     }
-    // Writes the DLSS 5 lines (see Dlss5IniOn / Dlss5IniOff / Dlss5Presets) into OptiScaler.ini; returns how many were written.
-    int ApplyDlss5IniImpl()
+    // Writes one key of the OptiScaler.ini next to the launcher; false (and an error note) when the file or the write fails.
+    bool PutIni(const wchar_t* section, const wchar_t* key, const wchar_t* value)
     {
         const std::wstring ini = oc::ExeDir() + L"OptiScaler.ini";
         if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES)
-            return 0;
-        int n = 0;
-        auto write = [&](const std::vector<IniEntry>& v)
         {
-            for (const IniEntry& e : v)
-                if (WritePrivateProfileStringW(e.section, e.key, e.value, ini.c_str()))
-                    ++n;
-        };
-        if (st_.dlss5)
-        {
-            write(Dlss5IniOn());
-            const auto& presets = Dlss5Presets();
-            if (st_.dlss5Preset >= 0 && st_.dlss5Preset < static_cast<int>(presets.size()))
-                write(presets[st_.dlss5Preset].ini);
+            SetNote(L"OptiScaler.ini was not found next to the launcher.", Note::Error);
+            return false;
         }
-        else
-            write(Dlss5IniOff());
-        return n;
+        if (!WritePrivateProfileStringW(section, key, value, ini.c_str()))
+        {
+            SetNote(L"Could not update OptiScaler.ini. Check the file and permissions.", Note::Error);
+            return false;
+        }
+        return true;
+    }
+    // What OptiScaler.ini says right now (read again whenever the launcher looks at the file).
+    bool dlss5On_ = false; // [DlssNr] Enabled = true
+    bool hudFix_ = false;  // [OptiFG] HUDFix = true
+    bool asyncFg_ = false; // [FSRFG] AllowAsync = true
+    bool ReadFgState()
+    {
+        const std::wstring ini = oc::ExeDir() + L"OptiScaler.ini";
+        auto isTrue = [&](const wchar_t* sec, const wchar_t* key)
+        {
+            wchar_t v[32] = {};
+            GetPrivateProfileStringW(sec, key, L"auto", v, 32, ini.c_str());
+            return _wcsicmp(v, L"true") == 0;
+        };
+        const bool a = isTrue(L"DlssNr", L"Enabled"), b = isTrue(L"OptiFG", L"HUDFix"), c = isTrue(L"FSRFG", L"AllowAsync");
+        const bool changed = a != dlss5On_ || b != hudFix_ || c != asyncFg_;
+        dlss5On_ = a;
+        hudFix_ = b;
+        asyncFg_ = c;
+        return changed;
     }
     // OptiScaler's own frame limit: [Framerate] FramerateLimit = the refresh rate of the game's monitor (e.g. 75.000000)
     void ApplyOptiFpsLimit()
@@ -1704,6 +1685,7 @@ class App
         wchar_t v[16] = {};
         GetPrivateProfileStringW(L"CAS", L"Enabled", L"false", v, 16, (oc::ExeDir() + L"OptiScaler.ini").c_str());
         pictureOn_ = _wcsicmp(v, L"true") == 0;
+        ReadFgState();
     }
     RtssApi rtss_;
     std::wstring limitInfo_; // what the limiter has applied (shown under the Apply button)
@@ -2039,7 +2021,6 @@ void App::Start()
         ReadPictureState();
     }
     ApplyOptiFpsLimit(); // OptiScaler's frame limit = the monitor's refresh rate
-    ApplyDlss5IniImpl(); // the DLSS 5 window's lines
 
     const GameItem game = games_[selected_];
     if (!IsWindow(game.hwnd))
@@ -3001,7 +2982,7 @@ void App::OnClick(int id)
                 Save();
                 OnClick(kIdUpscalerApply); // the chosen Opti Upscaler is written again with every frame generation choice
 
-                SetNote(std::wstring(L"Selected: ") + kFgNames[st_.frameGenMode] + L". Press Apply to write OptiScaler.ini.", Note::Ok);
+                OnClick(kIdFrameGenApply); // choosing writes OptiScaler.ini straight away (no Apply button)
             }
         }
     }
@@ -3011,117 +2992,20 @@ void App::OnClick(int id)
         {
             SetNote(L"Invalid Frame Generation selection.", Note::Error);
         }
-        else if (st_.frameGenMode >= 5)
+        else
         {
-            // Combo MFG ("Combo"), Nukem FG ("Nukem FG"), FSR3-4 FG ("FSR3-4 FG"), Nvidia MFG ("DlssG"): everything inside
-            // that folder: only its OptiScaler.ini is copied next to the program, replacing the one there.
-            static const wchar_t* const shown[] = { L"Combo", L"Nukem FG", L"FSR3-4 FG", L"DlssG", L"FSR FG AL2", L"FSR FG LF" };
-            static const wchar_t* const labels[] = { L"Combo MFG", L"Nukem FG", L"FSR3-4 FG", L"Nvidia MFG", L"FSR FG (AntiLag2)", L"FSR FG (latency flex)" };
-            const int k = st_.frameGenMode - 5;
-            const std::wstring base = shown[k];
-            std::vector<std::wstring> folders = { base };
-            for (const wchar_t* sep : { L"_", L"-", L"" })
-            {
-                std::wstring v = base;
-                size_t p;
-                while ((p = v.find(L' ')) != std::wstring::npos)
-                    v.replace(p, 1, sep);
-                if (v != base)
-                    folders.push_back(v);
-            }
-            const std::wstring root = oc::ExeDir();
-            std::wstring from;
-            for (const std::wstring& f : folders)
-            {
-                const DWORD at = GetFileAttributesW((root + f).c_str());
-                if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY))
-                {
-                    from = root + f;
-                    break;
-                }
-            }
-            if (from.empty())
-            {
-                SetNote(L"The \"" + base + L"\" folder was not found next to the launcher.", Note::Error);
-            }
-            else
-            {
-                const std::wstring src = from + L"\\OptiScaler.ini";
-                if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
-                {
-                    SetNote(L"There is no OptiScaler.ini inside the \"" + base + L"\" folder.", Note::Error);
-                }
-                else if (!CopyFileW(src.c_str(), (root + L"OptiScaler.ini").c_str(), FALSE))
-                {
-                    SetNote(L"Could not replace OptiScaler.ini. Check the file and permissions.", Note::Error);
-                }
-                else
-                {
-                    WriteOptiScalerKeys(st_);
-                    ApplyVsyncToOptiScaler();
-                    Save();
-                    SetNote(std::wstring(L"OptiScaler.ini replaced with the ") + labels[k] + L" one. Restart the game to use the change.", Note::Ok);
-                }
-            }
-        }
-        else if (st_.frameGenMode == 0 || st_.frameGenMode == 1 || st_.frameGenMode == 4)
-        {
-            // Intel MFG (folder "intel MFG"), Arthur (folder "artur") and Intel Frame Generation (folder "intel FG"): use
-            // the ready-made OptiScaler.ini from that folder next to the launcher.
-            const bool arthur = st_.frameGenMode == 1;
-            const wchar_t* shownName = st_.frameGenMode == 0 ? L"intel MFG" : (arthur ? L"artur" : L"intel FG");
-            std::vector<std::wstring> folders;
-            if (st_.frameGenMode == 0)
-                folders = { L"intel MFG", L"intel_MFG", L"intelMFG", L"intel-MFG" };
-            else if (arthur)
-                folders = { L"artur" };
-            else
-                folders = { L"intel FG", L"intel_FG", L"intelFG", L"intel-FG" };
-            const std::wstring shown = shownName;
-            std::wstring src = oc::ExeDir() + folders[0] + L"\\OptiScaler.ini";
-            for (const std::wstring& folder : folders)
-            {
-                const std::wstring cand = oc::ExeDir() + folder + L"\\OptiScaler.ini";
-                if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES)
-                {
-                    src = cand;
-                    break;
-                }
-            }
-            const std::wstring dst = oc::ExeDir() + L"OptiScaler.ini";
-            if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
-            {
-                SetNote(L"The " + shown + L"\\OptiScaler.ini file was not found next to the launcher.", Note::Error);
-            }
-            else if (!CopyFileW(src.c_str(), dst.c_str(), FALSE))
-            {
-                SetNote(L"Could not replace OptiScaler.ini. Check the file and permissions.", Note::Error);
-            }
-            else
+            // Every frame generation is just two lines of [FrameGen] in OptiScaler.ini (the file itself is not replaced).
+            //                                      0        1         2        3       4        5        6         7       8       9        10
+            static const wchar_t* const output[11] = { L"XeFG", L"DLSSG", L"nofg", L"XeFG", L"XeFG", L"DLSSG", L"DLSSG", L"DLSSG", L"DLSSG", L"FSRFG", L"FSRFG" };
+            static const wchar_t* const nvngx[11] = { L"auto", L"Arturs", L"auto", L"auto", L"auto", L"Combo", L"Nukems", L"FFX", L"None", L"auto", L"auto" };
+            const int m = st_.frameGenMode;
+            if (PutIni(L"FrameGen", L"FGOutput", output[m]) && PutIni(L"FrameGen", L"FGNvngxReplacement", nvngx[m]))
             {
                 WriteOptiScalerKeys(st_);
                 ApplyVsyncToOptiScaler();
                 Save();
-                SetNote(std::wstring(L"OptiScaler.ini replaced with the ") + (arthur ? L"Arthur" : (st_.frameGenMode == 0 ? L"Intel MFG" : L"Intel FG")) + L" one. Restart the game to use the change.", Note::Ok);
-            }
-        }
-        else
-        {
-            static const wchar_t* values[] = {
-                L"XeFG", L"DLSSG", L"nofg", L"fsrfg"
-            };
-            const std::wstring iniPath = oc::ExeDir() + L"OptiScaler.ini";
-
-            if (WritePrivateProfileStringW(
-                    L"FrameGen", L"FGOutput",
-                    values[st_.frameGenMode], iniPath.c_str()))
-            {
-                ApplyVsyncToOptiScaler();
-                SetNote(L"OptiScaler.ini updated. Restart the game to use the change.", Note::Ok);
-            }
-            else
-            {
-                SetNote(L"Could not update OptiScaler.ini. Check the file and permissions.", Note::Error);
+                SetNote(std::wstring(L"OptiScaler.ini: FGOutput = ") + output[m] + L", FGNvngxReplacement = " + nvngx[m] +
+                            L". Restart the game to use the change.", Note::Ok);
             }
         }
         // the ini was just replaced: the chosen upscaler, the multi frame generation count and the picture upscaler go back in
@@ -3250,38 +3134,27 @@ void App::OnClick(int id)
     }
     else if (id == kIdD5Enable)
     {
-        st_.dlss5 = st_.dlss5 ? 0 : 1;
-        Save();
-        const int n = ApplyDlss5IniImpl();
-        SetNote(std::wstring(st_.dlss5 ? L"DLSS 5 enabled" : L"DLSS 5 disabled") +
-                    (n > 0 ? L". OptiScaler.ini updated." : L". (no OptiScaler.ini lines are set for DLSS 5 yet)") +
-                    (Running() ? L" Applies the next time you press START." : L""),
-                Note::Ok);
+        if (PutIni(L"DlssNr", L"Enabled", dlss5On_ ? L"auto" : L"true"))
+        {
+            ReadFgState();
+            SetNote(dlss5On_ ? L"DLSS 5 enabled ([DlssNr] Enabled = true)." : L"DLSS 5 disabled ([DlssNr] Enabled = auto).", Note::Ok);
+        }
         InvalidatePanel();
     }
-    else if (id == kIdD5Preset)
+    else if (id == kIdHudFix)
     {
-        const auto& presets = Dlss5Presets();
-        HMENU menu = CreatePopupMenu();
-        if (menu)
+        if (PutIni(L"OptiFG", L"HUDFix", hudFix_ ? L"auto" : L"true"))
         {
-            for (int v = 0; v < static_cast<int>(presets.size()); ++v)
-                AppendMenuW(menu, MF_STRING | (st_.dlss5Preset == v ? MF_CHECKED : 0), kD5PresetMenuBase + v, presets[v].name);
-            POINT pt{};
-            GetCursorPos(&pt);
-            const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, panel_ ? panel_ : hwnd_, nullptr);
-            DestroyMenu(menu);
-            if (cmd >= static_cast<UINT>(kD5PresetMenuBase) && cmd < static_cast<UINT>(kD5PresetMenuBase) + presets.size())
-            {
-                st_.dlss5Preset = static_cast<int>(cmd - kD5PresetMenuBase);
-                Save();
-                if (st_.dlss5)
-                    ApplyDlss5IniImpl();
-                SetNote(std::wstring(L"DLSS 5 preset: ") + presets[st_.dlss5Preset].name +
-                            (Running() ? L". Applies the next time you press START." : L"."),
-                        Note::Ok);
-                InvalidatePanel();
-            }
+            ReadFgState();
+            SetNote(hudFix_ ? L"HUD FIX on ([OptiFG] HUDFix = true)." : L"HUD FIX off ([OptiFG] HUDFix = auto).", Note::Ok);
+        }
+    }
+    else if (id == kIdAsyncFg)
+    {
+        if (PutIni(L"FSRFG", L"AllowAsync", asyncFg_ ? L"auto" : L"true"))
+        {
+            ReadFgState();
+            SetNote(asyncFg_ ? L"ASYNC on ([FSRFG] AllowAsync = true)." : L"ASYNC off ([FSRFG] AllowAsync = auto).", Note::Ok);
         }
     }
     else if (id == kIdD5Download)
@@ -3634,7 +3507,7 @@ void App::OnClick(int id)
 namespace
 {
 constexpr float kPanelW = 250.0f; // logical units, like the main window (see S / R)
-constexpr float kPanelH = 400.0f;
+constexpr float kPanelH = 440.0f;
 } // namespace
 
 LRESULT CALLBACK App::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -3734,60 +3607,60 @@ void App::PaintPanel(HDC dc, int W, int H)
         g.DrawLine(&sep, S(18), S(78), S(232), S(78));
     }
 
-    // enable / disable
+    // enable / disable: shows what OptiScaler.ini says ([DlssNr] Enabled = true)
     {
         const gp::RectF box = R(18, 94, 18, 18);
         const bool hot = hover_ == kIdD5Enable;
-        FillRound(g, box, S(5), st_.dlss5 ? col::Accent() : col::Row());
+        FillRound(g, box, S(5), dlss5On_ ? col::Accent() : col::Row());
         StrokeRound(g, box, S(5), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
-        if (st_.dlss5)
-            Text(g, L"✓", *f_.chip, box, col::White(), 1);
+        if (dlss5On_)
+            Text(g, L"\u2713", *f_.chip, box, col::White(), 1);
         Text(g, L"Enable DLSS 5", *f_.bodyB, R(44, 92, 150, 22), col::Text());
-        Text(g, st_.dlss5 ? L"On" : L"Off", *f_.bodyB, R(180, 92, 52, 22), st_.dlss5 ? col::Green() : col::Muted(), 2);
+        Text(g, dlss5On_ ? L"On" : L"Off", *f_.bodyB, R(180, 92, 52, 22), dlss5On_ ? col::Green() : col::Muted(), 2);
         AddHit(R(18, 88, 214, 30), kIdD5Enable);
-    }
-
-    // presets
-    {
-        Text(g, L"Preset", *f_.bodyB, R(18, 134, 150, 22), col::Text());
-        const gp::RectF selector = R(18, 160, 214, 32);
-        const bool hot = hover_ == kIdD5Preset;
-        FillRound(g, selector, S(8), hot ? col::RowHot() : col::Row());
-        StrokeRound(g, selector, S(8), hot ? col::Accent() : col::Line(), max(1.0f, S(1)));
-        const auto& presets = Dlss5Presets();
-        const int pi = (st_.dlss5Preset >= 0 && st_.dlss5Preset < static_cast<int>(presets.size())) ? st_.dlss5Preset : 0;
-        Text(g, presets[pi].name, *f_.chip, R(28, 166, 190, 22), col::Text());
-        AddHit(selector, kIdD5Preset);
     }
 
     {
         gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
-        g.DrawLine(&sep, S(18), S(212), S(232), S(212));
+        g.DrawLine(&sep, S(18), S(130), S(232), S(130));
     }
 
-    // the file the DLSS 5 needs
+    // the file DLSS 5 needs, next to the program
+    float y = 142.0f;
     {
         const bool have = DlssnrPresent();
-        Text(g, L"Required file", *f_.bodyB, R(18, 224, 214, 22), col::Text());
-        Text(g, kDlssnrFile, *f_.sm, R(18, 248, 214, 18), col::Muted());
+        Text(g, L"Required file", *f_.bodyB, R(18, y, 214, 22), col::Text());
+        Text(g, kDlssnrFile, *f_.sm, R(18, y + 24, 214, 18), col::Muted());
+        y += 50.0f;
         if (have)
         {
-            Text(g, L"✓  Found next to the program", *f_.bodyB, R(18, 274, 218, 22), col::Green());
+            Text(g, L"\u2713  Found next to the program", *f_.bodyB, R(18, y, 218, 22), col::Green());
+            y += 26.0f;
         }
         else
         {
-            Text(g, L"✗  Not found next to the program", *f_.bodyB, R(18, 274, 218, 22), col::Red());
-            Text(g, L"DLSS 5 will not work without it.", *f_.sm, R(18, 298, 218, 18), col::Red());
+            Text(g, L"\u2717  Not found next to the program", *f_.bodyB, R(18, y, 218, 22), col::Red());
+            Text(g, L"DLSS 5 will not work without it.", *f_.sm, R(18, y + 24, 218, 18), col::Red());
+            y += 50.0f;
 
-            const bool hasUrl = kDlssnrUrl[0] != 0;
-            const gp::RectF link = R(18, 324, 214, 22);
+            const gp::RectF link = R(18, y, 214, 22);
             const bool hot = hover_ == kIdD5Download;
-            Text(g, hasUrl ? L"Download nvngx_dlssnr.dll" : L"Download link: not set yet", hot ? *f_.link : *f_.linkN, link,
-                 hasUrl ? (hot ? col::Accent2() : col::Accent()) : col::Muted());
+            Text(g, L"Download nvngx_dlssnr.dll", hot ? *f_.link : *f_.linkN, link, hot ? col::Accent2() : col::Accent());
             AddHit(link, kIdD5Download);
-            Text(g, L"Download it and put it next to the launcher.", *f_.tiny, R(18, 348, 218, 14), col::Muted());
+            y += 26.0f;
+            Text(g, L"Download it and place it exactly next to the program.", *f_.tiny, R(18, y, 218, 30), col::Muted(), 0, true);
+            y += 34.0f;
         }
-        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.tiny, R(18, have ? 300 : 366, 218, 14), col::Muted());
+        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.tiny, R(18, y, 218, 14), col::Muted());
+        y += 26.0f;
+    }
+
+    {
+        gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
+        g.DrawLine(&sep, S(18), S(y), S(232), S(y));
+        Text(g, L"DLSS 5 settings", *f_.bodyB, R(18, y + 10, 214, 22), col::Text());
+        Text(g, L"In the game, open the OptiScaler menu and go to the Neural Rendering section to change the settings you want.",
+             *f_.tiny, R(18, y + 34, 218, 60), col::Muted(), 0, true);
     }
 
     hits2_.swap(hits_);
@@ -3806,6 +3679,9 @@ LRESULT App::OnPanelMessage(UINT m, WPARAM w, LPARAM l)
         return MA_NOACTIVATE; // clicking here must not take the focus from the game / main window
 
     case WM_TIMER:
+        // look at OptiScaler.ini and at the dll again (they may have been changed by hand)
+        if (ReadFgState())
+            Invalidate();
         InvalidatePanel();
         return 0;
 
@@ -4643,13 +4519,21 @@ void App::Paint(HDC dc, int W, int H)
             if (!locked)
                 AddHit(selector, kIdFrameGenSelect);
 
-            const gp::RectF apply = R(800, 412, 92, 30);
-            const bool applyHot = hover_ == kIdFrameGenApply && !locked;
-            FillRound(g, apply, S(8), applyHot ? col::Accent2() : col::Accent());
-            StrokeRound(g, apply, S(8), col::Line(), max(1.0f, S(1)));
-            Text(g, L"Apply", *f_.chip, apply, col::White(), 1);
-            if (!locked)
-                AddHit(apply, kIdFrameGenApply);
+            // HUD FIX / ASYNC: tick boxes, they write (and read) OptiScaler.ini: true when ticked, auto when not
+            auto tick = [&](float y, const wchar_t* label, bool on, int id)
+            {
+                const gp::RectF box = R(802, y + 1, 13, 13);
+                const bool hot = hover_ == id && !locked;
+                FillRound(g, box, S(4), on ? col::Accent() : col::Row());
+                StrokeRound(g, box, S(4), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
+                if (on)
+                    Text(g, L"\u2713", *f_.tiny, box, col::White(), 1);
+                Text(g, label, *f_.tiny, R(820, y - 1, 74, 16), locked ? col::Muted() : col::Text());
+                if (!locked)
+                    AddHit(R(798, y - 1, 96, 17), id);
+            };
+            tick(413, L"HUD FIX", hudFix_, kIdHudFix);
+            tick(430, L"ASYNC", asyncFg_, kIdAsyncFg);
         }
 
         // ---- Upscaler controls ----
