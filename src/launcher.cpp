@@ -74,6 +74,7 @@ constexpr int kIdLinkGithub = 50;
 constexpr int kIdD5Enable = 70;   // DLSS 5 side window: enable / disable
 constexpr int kIdHudFix = 73;     // tick box: [OptiFG] HUDFix
 constexpr int kIdAsyncFg = 74;    // tick box: [FSRFG] AllowAsync
+constexpr int kIdD5Toggle = 75;   // header button: opens / closes the DLSS 5 window
 constexpr int kIdD5Download = 72; // DLSS 5 side window: download link for nvngx_dlssnr.dll
 constexpr const wchar_t* kPanelClass = L"OptiCaptureLauncherDlss5";
 constexpr const wchar_t* kDlssnrFile = L"nvngx_dlssnr.dll";
@@ -1430,6 +1431,7 @@ class App
     static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM w, LPARAM l);
     LRESULT OnPanelMessage(UINT m, WPARAM w, LPARAM l);
     bool CreatePanel();
+    bool panelOpen_ = false; // the DLSS 5 window is shown (header button "DLSS 5")
     void DockPanel();
     void PaintPanel(HDC dc, int w, int h);
     int HitAt2(int x, int y) const;
@@ -2976,9 +2978,7 @@ void App::OnClick(int id)
             if (cmd >= kFgMenuBase && cmd <= kFgMenuBase + 10)
             {
                 st_.frameGenMode = static_cast<int>(cmd - kFgMenuBase);
-                st_.optiFps = 1; // "OptiScaler fps = Hz" goes on with every frame generation choice
-                vsyncMode_ = -1; // and VSync goes to Auto
-                ApplyVsyncToOptiScaler();
+                // VSync and "OptiScaler FPS = Hz" are left as they are: only the quick modes at the top set them
                 Save();
                 OnClick(kIdUpscalerApply); // the chosen Opti Upscaler is written again with every frame generation choice
 
@@ -3131,6 +3131,25 @@ void App::OnClick(int id)
                 SetNote(L"Press Apply to use the limiter setting.", Note::Info);
             }
         }
+    }
+    else if (id == kIdD5Toggle)
+    {
+        panelOpen_ = !panelOpen_;
+        if (panel_)
+        {
+            if (panelOpen_)
+            {
+                ReadFgState();
+                DockPanel();
+                ShowWindow(panel_, SW_SHOWNOACTIVATE);
+                InvalidatePanel();
+            }
+            else
+            {
+                ShowWindow(panel_, SW_HIDE);
+            }
+        }
+        Invalidate();
     }
     else if (id == kIdD5Enable)
     {
@@ -3544,8 +3563,7 @@ bool App::CreatePanel()
     DwmSetWindowAttribute(panel_, 33, &round, sizeof(round));
     SetTimer(panel_, 1, 1500, nullptr); // looks again whether nvngx_dlssnr.dll is next to the program
 
-    DockPanel();
-    ShowWindow(panel_, SW_SHOWNOACTIVATE);
+    DockPanel(); // stays hidden until the "DLSS 5" button of the main window is pressed
     return true;
 }
 
@@ -4100,6 +4118,16 @@ void App::Paint(HDC dc, int W, int H)
          col::Muted());
 
     {
+        // "DLSS 5" button: opens / closes the small window docked to the right side of this one
+        const gp::RectF b = R(634, 30, 112, 30);
+        const bool hot = hover_ == kIdD5Toggle;
+        FillRound(g, b, S(15), panelOpen_ ? col::Alpha(col::Accent(), 90) : (hot ? col::RowHot() : col::Row()));
+        StrokeRound(g, b, S(15), panelOpen_ ? col::Accent() : (hot ? col::Accent2() : col::Line()), max(1.0f, S(panelOpen_ ? 2 : 1)));
+        Text(g, panelOpen_ ? L"DLSS 5  \u2039" : L"DLSS 5  \u203A", *f_.bodyB, b, col::Text(), 1);
+        AddHit(b, kIdD5Toggle);
+    }
+
+    {
         const gp::RectF pill = R(762, 30, 150, 30);
         const gp::Color tone = stopping_ ? col::Amber() : (running ? col::Green() : col::Muted());
         FillRound(g, pill, S(15), col::Alpha(tone, 36));
@@ -4519,21 +4547,22 @@ void App::Paint(HDC dc, int W, int H)
             if (!locked)
                 AddHit(selector, kIdFrameGenSelect);
 
-            // HUD FIX / ASYNC: tick boxes, they write (and read) OptiScaler.ini: true when ticked, auto when not
-            auto tick = [&](float y, const wchar_t* label, bool on, int id)
+            // HUD FIX / ASYNC: tick boxes on the line between Frame Generation and Opti Upscaler; they write (and read)
+            // OptiScaler.ini: true when ticked, auto when not
+            auto tick = [&](float x, float w, const wchar_t* label, bool on, int id)
             {
-                const gp::RectF box = R(802, y + 1, 13, 13);
+                const gp::RectF box = R(x, 451, 18, 18);
                 const bool hot = hover_ == id && !locked;
-                FillRound(g, box, S(4), on ? col::Accent() : col::Row());
-                StrokeRound(g, box, S(4), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
+                FillRound(g, box, S(5), on ? col::Accent() : col::Row());
+                StrokeRound(g, box, S(5), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
                 if (on)
-                    Text(g, L"\u2713", *f_.tiny, box, col::White(), 1);
-                Text(g, label, *f_.tiny, R(820, y - 1, 74, 16), locked ? col::Muted() : col::Text());
+                    Text(g, L"\u2713", *f_.chip, box, col::White(), 1);
+                Text(g, label, *f_.body, R(x + 26, 449, w - 26, 22), locked ? col::Muted() : col::Text());
                 if (!locked)
-                    AddHit(R(798, y - 1, 96, 17), id);
+                    AddHit(R(x - 4, 447, w + 4, 26), id);
             };
-            tick(413, L"HUD FIX", hudFix_, kIdHudFix);
-            tick(430, L"ASYNC", asyncFg_, kIdAsyncFg);
+            tick(714, 92, L"HUD FIX", hudFix_, kIdHudFix);
+            tick(812, 80, L"ASYNC", asyncFg_, kIdAsyncFg);
         }
 
         // ---- Upscaler controls ----
@@ -4550,24 +4579,17 @@ void App::Paint(HDC dc, int W, int H)
             Text(g, L"Opti Upscaler", *f_.bodyB,
                 R(560, 448, 230, 24), col::Text());
 
-            const gp::RectF selector = R(560, 472, 230, 30);
+            const gp::RectF selector = R(560, 472, 332, 30);
             const bool selectorHot = hover_ == kIdUpscalerSelect && !locked;
             FillRound(g, selector, S(8), selectorHot ? col::RowHot() : col::Row());
             StrokeRound(g, selector, S(8),
                 selectorHot ? col::Accent() : col::Line(), max(1.0f, S(1)));
             Text(g, upscalerNames[(st_.upscalerMode >= 0 && st_.upscalerMode <= 5)
                 ? st_.upscalerMode : 0], *f_.chip,
-                R(568, 478, 214, 22), locked ? col::Muted() : col::Text());
+                R(568, 478, 316, 22), locked ? col::Muted() : col::Text());
             if (!locked)
                 AddHit(selector, kIdUpscalerSelect);
 
-            const gp::RectF apply = R(800, 472, 92, 30);
-            const bool applyHot = hover_ == kIdUpscalerApply && !locked;
-            FillRound(g, apply, S(8), applyHot ? col::Accent2() : col::Accent());
-            StrokeRound(g, apply, S(8), col::Line(), max(1.0f, S(1)));
-            Text(g, L"Apply", *f_.chip, apply, col::White(), 1);
-            if (!locked)
-                AddHit(apply, kIdUpscalerApply);
         }
 
         // ---- "Run the upscaler on the picture" (sharpening + CAS + native upscaler pass) ----
