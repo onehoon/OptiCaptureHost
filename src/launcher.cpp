@@ -4119,7 +4119,7 @@ void App::Paint(HDC dc, int W, int H)
 
     {
         // "DLSS 5" button: opens / closes the small window docked to the right side of this one
-        const gp::RectF b = R(634, 30, 112, 30);
+        const gp::RectF b = R(792, 30, 120, 30);
         const bool hot = hover_ == kIdD5Toggle;
         FillRound(g, b, S(15), panelOpen_ ? col::Alpha(col::Accent(), 90) : (hot ? col::RowHot() : col::Row()));
         StrokeRound(g, b, S(15), panelOpen_ ? col::Accent() : (hot ? col::Accent2() : col::Line()), max(1.0f, S(panelOpen_ ? 2 : 1)));
@@ -4128,7 +4128,7 @@ void App::Paint(HDC dc, int W, int H)
     }
 
     {
-        const gp::RectF pill = R(762, 30, 150, 30);
+        const gp::RectF pill = R(634, 30, 150, 30);
         const gp::Color tone = stopping_ ? col::Amber() : (running ? col::Green() : col::Muted());
         FillRound(g, pill, S(15), col::Alpha(tone, 36));
         StrokeRound(g, pill, S(15), col::Alpha(tone, 120), max(1.0f, S(1)));
@@ -4536,14 +4536,14 @@ void App::Paint(HDC dc, int W, int H)
                 }
             }
 
-            const gp::RectF selector = R(560, 412, 230, 30);
+            const gp::RectF selector = R(560, 412, 332, 30);
             const bool selectorHot = hover_ == kIdFrameGenSelect && !locked;
             FillRound(g, selector, S(8), selectorHot ? col::RowHot() : col::Row());
             StrokeRound(g, selector, S(8),
                 selectorHot ? col::Accent() : col::Line(), max(1.0f, S(1)));
             Text(g, kFgNames[(st_.frameGenMode >= 0 && st_.frameGenMode <= 10)
                 ? st_.frameGenMode : 0], *f_.chip,
-                R(568, 418, 214, 22), locked ? col::Muted() : col::Text());
+                R(568, 418, 316, 22), locked ? col::Muted() : col::Text());
             if (!locked)
                 AddHit(selector, kIdFrameGenSelect);
 

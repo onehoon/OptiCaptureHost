@@ -584,6 +584,11 @@ class Host
     bool interactive_ = false;
     int menuKeyStage_ = 0; // 0 idle, 1 waiting to press the menu key, 2 waiting to release it
     std::chrono::steady_clock::time_point menuKeyAt_{};
+    // Some games minimise themselves the moment they lose the focus (Ctrl+Shift+F10 / F11 give it to the overlay). For a few
+    // seconds after such a shortcut a minimised game is put back on screen without taking the focus away from the overlay.
+    std::chrono::steady_clock::time_point keepGameUntil_{};
+    std::chrono::steady_clock::time_point keepGameCheck_{};
+    void KeepGameVisible(std::chrono::steady_clock::time_point now);
     bool tearing_ = false;
     UINT swapFlags_ = 0;
     HANDLE waitable_ = nullptr; // Lossless-style mode: swap chain frame latency waitable object (owned, closed at shutdown)
@@ -2565,6 +2570,7 @@ void Host::EnforceOverlayStyle()
 
 void Host::ToggleInteractive()
 {
+    keepGameUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     interactive_ = !interactive_;
     LONG_PTR ex = GetWindowLongPtrW(overlay_, GWL_EXSTYLE);
     if (interactive_)
@@ -2587,6 +2593,18 @@ void Host::ToggleInteractive()
     {
         ForceForeground(target_);
         Log("Click-through ON: focus returned to the game.");
+    }
+}
+
+void Host::KeepGameVisible(std::chrono::steady_clock::time_point now)
+{
+    if (now >= keepGameUntil_ || now - keepGameCheck_ < std::chrono::milliseconds(80))
+        return;
+    keepGameCheck_ = now;
+    if (target_ && IsWindow(target_) && IsIconic(target_))
+    {
+        ShowWindow(target_, SW_SHOWNOACTIVATE); // back on screen, the focus stays where the shortcut put it
+        Log("The game minimised itself when it lost the focus: put back on screen");
     }
 }
 
@@ -2634,6 +2652,7 @@ void Host::SendMenuKey(bool up)
 // OptiScaler has seen the focus change first). Press it again to close the menu.
 void Host::OpenMenu()
 {
+    keepGameUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     if (!interactive_)
         ToggleInteractive();
     else
@@ -2760,9 +2779,71 @@ bool Host::LauncherInFront() const
     return wcscmp(cls, L"OptiCaptureLauncher") == 0;
 }
 
+// ---- Stop shortcut: a second, independent way to see it --------------------------------------------------------
+// The stop shortcut is a RegisterHotKey message that only reaches the capture loop between two frames, and another program
+// can hold the same key. A small thread therefore also watches the keys themselves; if the capture loop does not react in
+// time (stuck inside a Present or a driver call) the process is ended, so STOP never leaves a half working capture behind.
+std::atomic<bool> g_quitReq{ false };   // stop was asked for (by either way)
+std::atomic<bool> g_loopDone{ false };  // the capture loop has seen it and left
+std::atomic<UINT> g_stopMods{ 0 };
+std::atomic<UINT> g_stopVk{ 0 };
+std::atomic<bool> g_keyThreadOn{ false };
+
+bool StopKeysDown()
+{
+    const UINT vk = g_stopVk.load();
+    const UINT mods = g_stopMods.load();
+    if (vk == 0)
+        return false;
+    auto down = [](int k) { return (GetAsyncKeyState(k) & 0x8000) != 0; };
+    if (!down(static_cast<int>(vk)))
+        return false;
+    if ((mods & MOD_CONTROL) && !down(VK_CONTROL))
+        return false;
+    if ((mods & MOD_SHIFT) && !down(VK_SHIFT))
+        return false;
+    if ((mods & MOD_ALT) && !down(VK_MENU))
+        return false;
+    return true;
+}
+
+void StartStopKeyWatcher()
+{
+    if (g_keyThreadOn.exchange(true))
+        return;
+    std::thread([] {
+        bool was = false;
+        ULONGLONG askedAt = 0;
+        for (;;)
+        {
+            Sleep(20);
+            const bool down = StopKeysDown();
+            if (down && !was && !g_quitReq.load())
+            {
+                g_quitReq = true;
+                Log("Stop shortcut seen by the key watcher");
+            }
+            was = down;
+            if (g_quitReq.load())
+            {
+                if (askedAt == 0)
+                    askedAt = GetTickCount64();
+                if (!g_loopDone.load() && GetTickCount64() - askedAt > 2000)
+                {
+                    Log("The capture loop did not react to the stop shortcut in 2 s: ending the process");
+                    TerminateProcess(GetCurrentProcess(), 0);
+                }
+            }
+        }
+    }).detach();
+}
+
 void Host::RegisterHotkeys()
 {
     UnregisterHotkeys();
+    g_stopMods = st_.stop.mods;
+    g_stopVk = st_.stop.vk;
+    StartStopKeyWatcher();
     const struct
     {
         int id;
@@ -2965,7 +3046,10 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             if (msg.message == WM_QUIT)
                 running = false;
             else if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyQuit)
+            {
+                g_quitReq = true;
                 running = false;
+            }
             else if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyInteractive)
                 ToggleInteractive();
             else if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyMenu)
@@ -2977,6 +3061,8 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             }
         }
 
+        if (g_quitReq.load())
+            running = false;
         if (!running)
             break;
         if (targetClosed_ || !IsWindow(target_))
@@ -2986,6 +3072,7 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
         }
 
         const auto now = std::chrono::steady_clock::now();
+        KeepGameVisible(now);
 
         if (menuKeyStage_ != 0 && now >= menuKeyAt_)
         {
@@ -3406,7 +3493,8 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
         }
     }
 
-    Log("Shutting down");
+    g_loopDone = true;
+    Log("Shutting down%s", g_quitReq.load() ? " (stop shortcut)" : "");
     // With some frame generation libraries (Nukem FG, FSR3-4 FG) closing takes long or ends in a crash while their DLLs unload.
     // A watchdog ends the process with code 0 if the clean-up does not finish in time, so the launcher does not report an error.
     std::thread([] {
