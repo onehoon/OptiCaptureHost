@@ -3526,7 +3526,8 @@ void App::OnClick(int id)
 namespace
 {
 constexpr float kPanelW = 250.0f; // logical units, like the main window (see S / R)
-constexpr float kPanelH = 440.0f;
+constexpr float kPanelH = 520.0f;
+constexpr float kPanelDrop = 90.0f; // how far below the top of the main window the DLSS 5 window starts
 } // namespace
 
 LRESULT CALLBACK App::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -3582,7 +3583,10 @@ void App::DockPanel()
     int x = r.right + 2;
     if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi) && x + pw > mi.rcWork.right)
         x = r.left - pw - 2;
-    SetWindowPos(panel_, nullptr, x, r.top, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+    int y = r.top + static_cast<int>(S(kPanelDrop));
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi) && y + ph > mi.rcWork.bottom)
+        y = (std::max)(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom) - ph);
+    SetWindowPos(panel_, nullptr, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 int App::HitAt2(int x, int y) const
@@ -3666,11 +3670,11 @@ void App::PaintPanel(HDC dc, int W, int H)
             Text(g, L"Download nvngx_dlssnr.dll", hot ? *f_.link : *f_.linkN, link, hot ? col::Accent2() : col::Accent());
             AddHit(link, kIdD5Download);
             y += 26.0f;
-            Text(g, L"Download it and place it exactly next to the program.", *f_.tiny, R(18, y, 218, 30), col::Muted(), 0, true);
-            y += 34.0f;
+            Text(g, L"Download it and place it exactly next to the program.", *f_.sm, R(18, y, 218, 36), col::Muted(), 0, true);
+            y += 44.0f;
         }
-        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.tiny, R(18, y, 218, 14), col::Muted());
-        y += 26.0f;
+        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.sm, R(18, y, 218, 18), col::Muted());
+        y += 30.0f;
     }
 
     {
@@ -3678,7 +3682,7 @@ void App::PaintPanel(HDC dc, int W, int H)
         g.DrawLine(&sep, S(18), S(y), S(232), S(y));
         Text(g, L"DLSS 5 settings", *f_.bodyB, R(18, y + 10, 214, 22), col::Text());
         Text(g, L"In the game, open the OptiScaler menu and go to the Neural Rendering section to change the settings you want.",
-             *f_.tiny, R(18, y + 34, 218, 60), col::Muted(), 0, true);
+             *f_.sm, R(18, y + 36, 218, 110), col::Text(), 0, true);
     }
 
     hits2_.swap(hits_);
@@ -4600,7 +4604,7 @@ void App::Paint(HDC dc, int W, int H)
             const bool hotOn = hover_ == kIdPictureOn && !locked;
             FillRound(g, onB, S(8), hotOn ? col::Accent2() : col::Accent());
             StrokeRound(g, onB, S(8), col::Line(), max(1.0f, S(1)));
-            Text(g, L"Apply", *f_.chip, onB, col::White(), 1);
+            Text(g, L"Enable", *f_.chip, onB, col::White(), 1);
             if (!locked)
                 AddHit(onB, kIdPictureOn);
 
