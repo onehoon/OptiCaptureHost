@@ -47,6 +47,8 @@ struct Settings
     int limitMode = 1;        // RTSS limiter mode: 0 async, 1 front edge sync, 2 back edge sync
     int profileAuto = 0;      // apply a saved game profile automatically when its game is picked
     int hideOsd = 1;          // turn the RTSS on-screen display of the game off while the host runs
+    int dlss5 = 0;            // DLSS 5 window: enabled; [DLSS5] Enabled
+    int dlss5Preset = 0;      // DLSS 5 window: chosen preset (index); [DLSS5] Preset
     int optiFps = 1;          // write OptiScaler.ini [Framerate] FramerateLimit = the monitor's refresh rate at every START
     int limitAuto = 0;        // apply the RTSS limiter every time START is pressed
     int limitFps = 0;         // 0 refresh rate, -2 half refresh rate, else fixed fps
@@ -133,6 +135,9 @@ inline void LoadSettings(Settings& s)
     s.profileAuto = GetPrivateProfileIntW(L"Profiles", L"Auto", 0, path.c_str()) != 0 ? 1 : 0;
     s.hideOsd = GetPrivateProfileIntW(L"Limiter", L"HideOsd", 1, path.c_str()) != 0 ? 1 : 0;
     s.optiFps = GetPrivateProfileIntW(L"Limiter", L"OptiFps", 1, path.c_str()) != 0 ? 1 : 0;
+    s.dlss5 = GetPrivateProfileIntW(L"DLSS5", L"Enabled", 0, path.c_str()) != 0 ? 1 : 0;
+    s.dlss5Preset = GetPrivateProfileIntW(L"DLSS5", L"Preset", 0, path.c_str());
+    if (s.dlss5Preset < 0) s.dlss5Preset = 0;
     s.limitAuto = GetPrivateProfileIntW(L"Limiter", L"Auto", 0, path.c_str()) != 0 ? 1 : 0;
     s.limitMode = GetPrivateProfileIntW(L"Limiter", L"Mode", 1, path.c_str());
     if (s.limitMode < 0 || s.limitMode > 2) s.limitMode = 1;
@@ -186,6 +191,8 @@ inline void SaveSettings(const Settings& s)
     WritePrivateProfileStringW(L"Profiles", L"Auto", std::to_wstring(s.profileAuto).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Limiter", L"HideOsd", std::to_wstring(s.hideOsd).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Limiter", L"OptiFps", std::to_wstring(s.optiFps).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"DLSS5", L"Enabled", std::to_wstring(s.dlss5).c_str(), path.c_str());
+    WritePrivateProfileStringW(L"DLSS5", L"Preset", std::to_wstring(s.dlss5Preset).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Limiter", L"Auto", std::to_wstring(s.limitAuto).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Limiter", L"Mode", std::to_wstring(s.limitMode).c_str(), path.c_str());
     WritePrivateProfileStringW(L"Limiter", L"Fps", std::to_wstring(s.limitFps).c_str(), path.c_str());

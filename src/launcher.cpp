@@ -71,6 +71,14 @@ constexpr int kIdLinkJH = 8;
 constexpr int kIdLinkApps = 9;
 constexpr int kIdLinkArchive = 10;
 constexpr int kIdLinkGithub = 50;
+constexpr int kIdD5Enable = 70;   // DLSS 5 side window: enable / disable
+constexpr int kIdD5Preset = 71;   // DLSS 5 side window: preset selector
+constexpr int kIdD5Download = 72; // DLSS 5 side window: download link for nvngx_dlssnr.dll
+constexpr int kD5PresetMenuBase = 5400;
+constexpr const wchar_t* kPanelClass = L"OptiCaptureLauncherDlss5";
+constexpr const wchar_t* kDlssnrFile = L"nvngx_dlssnr.dll";
+// Where users download nvngx_dlssnr.dll (to be filled in; empty = the window says the link is not set yet).
+constexpr const wchar_t* kDlssnrUrl = L"";
 constexpr int kIdOptiFps = 51; // OptiScaler FPS limit = monitor refresh rate
 constexpr int kIdMfg0 = 60; // 60..64: multi frame generation 2x / 3x / 4x / 5x / 6x
 constexpr int kFgMenuBase = 5000;
@@ -338,6 +346,39 @@ struct GameItem
     bool fills = false; // covers a whole monitor: borderless or fullscreen-sized, the usual look of a game
     HICON icon = nullptr; // owned by the window, never destroyed here
 };
+
+// The OptiScaler.ini lines the DLSS 5 window writes. Filled in as the settings are decided:
+// { section, key, value }. Nothing is written for an empty list.
+struct IniEntry
+{
+    const wchar_t* section;
+    const wchar_t* key;
+    const wchar_t* value;
+};
+
+struct Dlss5Preset
+{
+    const wchar_t* name;
+    std::vector<IniEntry> ini; // written when this preset is chosen and DLSS 5 is enabled
+};
+
+inline const std::vector<IniEntry>& Dlss5IniOn()  // written when DLSS 5 is enabled
+{
+    static const std::vector<IniEntry> v = {};
+    return v;
+}
+
+inline const std::vector<IniEntry>& Dlss5IniOff() // written when DLSS 5 is disabled
+{
+    static const std::vector<IniEntry> v = {};
+    return v;
+}
+
+inline const std::vector<Dlss5Preset>& Dlss5Presets()
+{
+    static const std::vector<Dlss5Preset> v = { { L"Default", {} } };
+    return v;
+}
 
 struct Hit
 {
@@ -1410,6 +1451,21 @@ class App
     };
 
     static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l);
+
+    // The DLSS 5 window: a small separate window docked to the right side of the main window.
+    HWND panel_ = nullptr;
+    std::vector<Hit> hits2_;
+    int hover2_ = kIdNone;
+    int pressed2_ = kIdNone;
+    bool tracking2_ = false;
+    static LRESULT CALLBACK PanelProc(HWND h, UINT m, WPARAM w, LPARAM l);
+    LRESULT OnPanelMessage(UINT m, WPARAM w, LPARAM l);
+    bool CreatePanel();
+    void DockPanel();
+    void PaintPanel(HDC dc, int w, int h);
+    int HitAt2(int x, int y) const;
+    void InvalidatePanel() { if (panel_) InvalidateRect(panel_, nullptr, FALSE); }
+    bool DlssnrPresent() const { return GetFileAttributesW((oc::ExeDir() + kDlssnrFile).c_str()) != INVALID_FILE_ATTRIBUTES; }
     LRESULT OnMessage(UINT m, WPARAM w, LPARAM l);
 
     float S(float v) const { return v * scale_ * 0.85f; }
@@ -1578,6 +1634,30 @@ class App
             return;
         const std::wstring v = st_.mfgCount == 0 ? std::wstring(L"auto") : std::to_wstring(st_.mfgCount);
         WritePrivateProfileStringW(st_.frameGenMode == 0 ? L"XeFG" : L"DLSSG", L"InterpolationCount", v.c_str(), ini.c_str());
+    }
+    // Writes the DLSS 5 lines (see Dlss5IniOn / Dlss5IniOff / Dlss5Presets) into OptiScaler.ini; returns how many were written.
+    int ApplyDlss5IniImpl()
+    {
+        const std::wstring ini = oc::ExeDir() + L"OptiScaler.ini";
+        if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return 0;
+        int n = 0;
+        auto write = [&](const std::vector<IniEntry>& v)
+        {
+            for (const IniEntry& e : v)
+                if (WritePrivateProfileStringW(e.section, e.key, e.value, ini.c_str()))
+                    ++n;
+        };
+        if (st_.dlss5)
+        {
+            write(Dlss5IniOn());
+            const auto& presets = Dlss5Presets();
+            if (st_.dlss5Preset >= 0 && st_.dlss5Preset < static_cast<int>(presets.size()))
+                write(presets[st_.dlss5Preset].ini);
+        }
+        else
+            write(Dlss5IniOff());
+        return n;
     }
     // OptiScaler's own frame limit: [Framerate] FramerateLimit = the refresh rate of the game's monitor (e.g. 75.000000)
     void ApplyOptiFpsLimit()
@@ -1772,6 +1852,7 @@ bool App::Create(HINSTANCE inst)
 
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
+    CreatePanel();
     return true;
 }
 
@@ -1958,6 +2039,7 @@ void App::Start()
         ReadPictureState();
     }
     ApplyOptiFpsLimit(); // OptiScaler's frame limit = the monitor's refresh rate
+    ApplyDlss5IniImpl(); // the DLSS 5 window's lines
 
     const GameItem game = games_[selected_];
     if (!IsWindow(game.hwnd))
@@ -3166,6 +3248,49 @@ void App::OnClick(int id)
             }
         }
     }
+    else if (id == kIdD5Enable)
+    {
+        st_.dlss5 = st_.dlss5 ? 0 : 1;
+        Save();
+        const int n = ApplyDlss5IniImpl();
+        SetNote(std::wstring(st_.dlss5 ? L"DLSS 5 enabled" : L"DLSS 5 disabled") +
+                    (n > 0 ? L". OptiScaler.ini updated." : L". (no OptiScaler.ini lines are set for DLSS 5 yet)") +
+                    (Running() ? L" Applies the next time you press START." : L""),
+                Note::Ok);
+        InvalidatePanel();
+    }
+    else if (id == kIdD5Preset)
+    {
+        const auto& presets = Dlss5Presets();
+        HMENU menu = CreatePopupMenu();
+        if (menu)
+        {
+            for (int v = 0; v < static_cast<int>(presets.size()); ++v)
+                AppendMenuW(menu, MF_STRING | (st_.dlss5Preset == v ? MF_CHECKED : 0), kD5PresetMenuBase + v, presets[v].name);
+            POINT pt{};
+            GetCursorPos(&pt);
+            const UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, panel_ ? panel_ : hwnd_, nullptr);
+            DestroyMenu(menu);
+            if (cmd >= static_cast<UINT>(kD5PresetMenuBase) && cmd < static_cast<UINT>(kD5PresetMenuBase) + presets.size())
+            {
+                st_.dlss5Preset = static_cast<int>(cmd - kD5PresetMenuBase);
+                Save();
+                if (st_.dlss5)
+                    ApplyDlss5IniImpl();
+                SetNote(std::wstring(L"DLSS 5 preset: ") + presets[st_.dlss5Preset].name +
+                            (Running() ? L". Applies the next time you press START." : L"."),
+                        Note::Ok);
+                InvalidatePanel();
+            }
+        }
+    }
+    else if (id == kIdD5Download)
+    {
+        if (kDlssnrUrl[0] != 0)
+            ShellExecuteW(hwnd_, L"open", kDlssnrUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        else
+            SetNote(L"The download link for nvngx_dlssnr.dll is not set yet.", Note::Error);
+    }
     else if (id == kIdOptiFps)
     {
         st_.optiFps = st_.optiFps ? 0 : 1;
@@ -3502,6 +3627,277 @@ void App::OnClick(int id)
     Invalidate();
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The DLSS 5 window: small, separate, docked to the right side of the main window
+// ---------------------------------------------------------------------------------------------------------------
+
+namespace
+{
+constexpr float kPanelW = 250.0f; // logical units, like the main window (see S / R)
+constexpr float kPanelH = 400.0f;
+} // namespace
+
+LRESULT CALLBACK App::PanelProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    App* self = reinterpret_cast<App*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (m == WM_NCCREATE)
+    {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(l);
+        self = static_cast<App*>(cs->lpCreateParams);
+        self->panel_ = h;
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    return self ? self->OnPanelMessage(m, w, l) : DefWindowProcW(h, m, w, l);
+}
+
+bool App::CreatePanel()
+{
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = PanelProc;
+    wc.hInstance = inst_;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kPanelClass;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return false;
+
+    // An owned popup: it stays above the main window, and hides / shows with it (minimise, restore).
+    panel_ = CreateWindowExW(WS_EX_TOOLWINDOW, kPanelClass, L"DLSS 5", WS_POPUP, 0, 0, static_cast<int>(S(kPanelW)),
+                             static_cast<int>(S(kPanelH)), hwnd_, nullptr, inst_, this);
+    if (!panel_)
+        return false;
+
+    const DWORD round = 2;
+    DwmSetWindowAttribute(panel_, 33, &round, sizeof(round));
+    SetTimer(panel_, 1, 1500, nullptr); // looks again whether nvngx_dlssnr.dll is next to the program
+
+    DockPanel();
+    ShowWindow(panel_, SW_SHOWNOACTIVATE);
+    return true;
+}
+
+// Puts the window against the right edge of the main window (left edge when there is no room on the right).
+void App::DockPanel()
+{
+    if (!panel_ || !hwnd_ || IsIconic(hwnd_))
+        return;
+    RECT r{};
+    GetWindowRect(hwnd_, &r);
+    const int pw = static_cast<int>(S(kPanelW));
+    const int ph = static_cast<int>(S(kPanelH));
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    int x = r.right + 2;
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi) && x + pw > mi.rcWork.right)
+        x = r.left - pw - 2;
+    SetWindowPos(panel_, nullptr, x, r.top, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+int App::HitAt2(int x, int y) const
+{
+    for (auto it = hits2_.rbegin(); it != hits2_.rend(); ++it)
+    {
+        if (it->r.Contains(static_cast<float>(x), static_cast<float>(y)))
+            return it->id;
+    }
+    return kIdNone;
+}
+
+void App::PaintPanel(HDC dc, int W, int H)
+{
+    gp::Graphics g(dc);
+    g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
+    g.SetTextRenderingHint(gp::TextRenderingHintClearTypeGridFit);
+
+    // The shared helpers (Text, FillRound, AddHit...) work on hits_ / hover_: borrow them for this window.
+    std::vector<Hit> savedHits;
+    savedHits.swap(hits_);
+    const int savedHover = hover_;
+    hover_ = hover2_;
+
+    {
+        gp::SolidBrush bg(col::Bg());
+        g.FillRectangle(&bg, 0, 0, W, H);
+        const gp::RectF glow(0.0f, 0.0f, static_cast<float>(W), S(90));
+        gp::LinearGradientBrush gb(glow, gp::Color(70, 108, 140, 255), gp::Color(0, 13, 15, 20), gp::LinearGradientModeVertical);
+        g.FillRectangle(&gb, glow);
+        gp::Pen border(col::Line(), max(1.0f, S(1)));
+        g.DrawRectangle(&border, 0.0f, 0.0f, static_cast<float>(W) - 1.0f, static_cast<float>(H) - 1.0f);
+    }
+
+    Text(g, L"DLSS 5", *f_.title, R(18, 14, 214, 34), col::Text());
+    Text(g, L"Optional  ·  needs nvngx_dlssnr.dll", *f_.sm, R(18, 50, 222, 18), col::Muted());
+    {
+        gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
+        g.DrawLine(&sep, S(18), S(78), S(232), S(78));
+    }
+
+    // enable / disable
+    {
+        const gp::RectF box = R(18, 94, 18, 18);
+        const bool hot = hover_ == kIdD5Enable;
+        FillRound(g, box, S(5), st_.dlss5 ? col::Accent() : col::Row());
+        StrokeRound(g, box, S(5), hot ? col::Accent2() : col::Line(), max(1.0f, S(1)));
+        if (st_.dlss5)
+            Text(g, L"✓", *f_.chip, box, col::White(), 1);
+        Text(g, L"Enable DLSS 5", *f_.bodyB, R(44, 92, 150, 22), col::Text());
+        Text(g, st_.dlss5 ? L"On" : L"Off", *f_.bodyB, R(180, 92, 52, 22), st_.dlss5 ? col::Green() : col::Muted(), 2);
+        AddHit(R(18, 88, 214, 30), kIdD5Enable);
+    }
+
+    // presets
+    {
+        Text(g, L"Preset", *f_.bodyB, R(18, 134, 150, 22), col::Text());
+        const gp::RectF selector = R(18, 160, 214, 32);
+        const bool hot = hover_ == kIdD5Preset;
+        FillRound(g, selector, S(8), hot ? col::RowHot() : col::Row());
+        StrokeRound(g, selector, S(8), hot ? col::Accent() : col::Line(), max(1.0f, S(1)));
+        const auto& presets = Dlss5Presets();
+        const int pi = (st_.dlss5Preset >= 0 && st_.dlss5Preset < static_cast<int>(presets.size())) ? st_.dlss5Preset : 0;
+        Text(g, presets[pi].name, *f_.chip, R(28, 166, 190, 22), col::Text());
+        AddHit(selector, kIdD5Preset);
+    }
+
+    {
+        gp::Pen sep(col::Alpha(col::Line(), 150), max(1.0f, S(1)));
+        g.DrawLine(&sep, S(18), S(212), S(232), S(212));
+    }
+
+    // the file the DLSS 5 needs
+    {
+        const bool have = DlssnrPresent();
+        Text(g, L"Required file", *f_.bodyB, R(18, 224, 214, 22), col::Text());
+        Text(g, kDlssnrFile, *f_.sm, R(18, 248, 214, 18), col::Muted());
+        if (have)
+        {
+            Text(g, L"✓  Found next to the program", *f_.bodyB, R(18, 274, 218, 22), col::Green());
+        }
+        else
+        {
+            Text(g, L"✗  Not found next to the program", *f_.bodyB, R(18, 274, 218, 22), col::Red());
+            Text(g, L"DLSS 5 will not work without it.", *f_.sm, R(18, 298, 218, 18), col::Red());
+
+            const bool hasUrl = kDlssnrUrl[0] != 0;
+            const gp::RectF link = R(18, 324, 214, 22);
+            const bool hot = hover_ == kIdD5Download;
+            Text(g, hasUrl ? L"Download nvngx_dlssnr.dll" : L"Download link: not set yet", hot ? *f_.link : *f_.linkN, link,
+                 hasUrl ? (hot ? col::Accent2() : col::Accent()) : col::Muted());
+            AddHit(link, kIdD5Download);
+            Text(g, L"Download it and put it next to the launcher.", *f_.tiny, R(18, 348, 218, 14), col::Muted());
+        }
+        Text(g, L"DLSS 5 needs version 310.9.16.", *f_.tiny, R(18, have ? 300 : 366, 218, 14), col::Muted());
+    }
+
+    hits2_.swap(hits_);
+    hits_.swap(savedHits);
+    hover_ = savedHover;
+}
+
+LRESULT App::OnPanelMessage(UINT m, WPARAM w, LPARAM l)
+{
+    switch (m)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE; // clicking here must not take the focus from the game / main window
+
+    case WM_TIMER:
+        InvalidatePanel();
+        return 0;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(panel_, &ps);
+        RECT rc{};
+        GetClientRect(panel_, &rc);
+        const int cw = rc.right - rc.left;
+        const int ch = rc.bottom - rc.top;
+        if (cw > 0 && ch > 0)
+        {
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cw, ch);
+            HGDIOBJ old = SelectObject(mem, bmp);
+            PaintPanel(mem, cw, ch);
+            BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+        }
+        EndPaint(panel_, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        if (!tracking2_)
+        {
+            TRACKMOUSEEVENT t{};
+            t.cbSize = sizeof(t);
+            t.dwFlags = TME_LEAVE;
+            t.hwndTrack = panel_;
+            TrackMouseEvent(&t);
+            tracking2_ = true;
+        }
+        const int h = HitAt2(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (h != hover2_)
+        {
+            hover2_ = h;
+            InvalidatePanel();
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        tracking2_ = false;
+        if (hover2_ != kIdNone)
+        {
+            hover2_ = kIdNone;
+            InvalidatePanel();
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT)
+        {
+            SetCursor(LoadCursorW(nullptr, hover2_ != kIdNone ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        pressed2_ = HitAt2(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        SetCapture(panel_);
+        return 0;
+
+    case WM_LBUTTONUP:
+    {
+        ReleaseCapture();
+        const int h = HitAt2(GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        const int was = pressed2_;
+        pressed2_ = kIdNone;
+        if (h != kIdNone && h == was)
+            OnClick(h);
+        InvalidatePanel();
+        Invalidate();
+        return 0;
+    }
+
+    case WM_DESTROY:
+        KillTimer(panel_, 1);
+        panel_ = nullptr;
+        return 0;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(panel_, m, w, l);
+}
+
 LRESULT App::OnMessage(UINT m, WPARAM w, LPARAM l)
 {
     switch (m)
@@ -3696,8 +4092,14 @@ LRESULT App::OnMessage(UINT m, WPARAM w, LPARAM l)
         }
         return 0;
 
+    case WM_MOVE:
+        DockPanel();
+        return 0;
+
     case WM_DPICHANGED:
         ApplyDpi(HIWORD(w), reinterpret_cast<const RECT*>(l));
+        DockPanel();
+        InvalidatePanel();
         return 0;
 
     case WM_CLOSE:
