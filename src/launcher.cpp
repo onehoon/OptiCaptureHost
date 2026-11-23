@@ -3450,7 +3450,7 @@ void App::OnClick(int id)
                     WritePrivateProfileStringW(L"DlssNr", L"NativeUpscalerPass", L"true", iniPath.c_str());
                 }
 
-                // FSR 3.1.6, FSR 4.1.2 and DLSS 3.7: also put the ready-made DLL set of that folder into the MK-JH folder.
+                // FSR 3.1.6, FSR 4.1.2 and DLSS 3.7: also put the ready-made DLL set of that folder into the MK-JH and / or OptiScaler folder (whichever exists).
                 if (st_.upscalerMode == 1 || st_.upscalerMode == 3 || st_.upscalerMode == 4 || st_.upscalerMode == 5)
                 {
                     const bool ditto = st_.upscalerMode == 5;
@@ -3463,7 +3463,7 @@ void App::OnClick(int id)
                     std::wstring from;
                     for (const std::wstring& n : names)
                     {
-                        for (const std::wstring& base : { root + L"MK-JH\\", root })
+                        for (const std::wstring& base : { root + L"MK-JH\\", root + L"OptiScaler\\", root })
                         {
                             const std::wstring cand = base + n;
                             const DWORD at = GetFileAttributesW(cand.c_str());
@@ -3479,20 +3479,37 @@ void App::OnClick(int id)
                     const std::wstring label = ditto ? L"DittoSR" : (fsr ? L"FSR 4" : L"Dlss 3.7");
                     if (from.empty())
                     {
-                        SetNote(L"OptiScaler.ini updated, but the \"" + label + L"\" folder was not found (next to the launcher or inside MK-JH).", Note::Error);
+                        SetNote(L"OptiScaler.ini updated, but the \"" + label + L"\" folder was not found (next to the launcher, or inside MK-JH / OptiScaler).", Note::Error);
                     }
                     else
                     {
-                        const std::wstring to = root + L"MK-JH";
-                        CreateDirectoryW(to.c_str(), nullptr);
+                        // Where the files go: the MK-JH folder and / or the OptiScaler folder, whichever exist (usually one of
+                        // them). When neither exists, MK-JH is made.
+                        std::vector<std::wstring> targets;
+                        for (const wchar_t* d : { L"MK-JH", L"OptiScaler" })
+                        {
+                            const DWORD at = GetFileAttributesW((root + d).c_str());
+                            if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY))
+                                targets.push_back(d);
+                        }
+                        if (targets.empty())
+                        {
+                            CreateDirectoryW((root + L"MK-JH").c_str(), nullptr);
+                            targets.push_back(L"MK-JH");
+                        }
                         int copied = 0, failed = 0;
-                        CopyTree(from, to, copied, failed);
+                        std::wstring names2;
+                        for (const std::wstring& t : targets)
+                        {
+                            CopyTree(from, root + t, copied, failed);
+                            names2 += (names2.empty() ? L"" : L" and ") + t;
+                        }
                         if (failed > 0)
-                            SetNote(L"Copied " + std::to_wstring(copied) + L" files from " + label + L" to MK-JH, but " + std::to_wstring(failed) +
+                            SetNote(L"Copied " + std::to_wstring(copied) + L" files from " + label + L" to " + names2 + L", but " + std::to_wstring(failed) +
                                         L" could not be replaced (is the game or the host still running?).", Note::Error);
                         else
                             SetNote(L"OptiScaler.ini updated and the " + label + L" files (" + std::to_wstring(copied) +
-                                        L") were copied into MK-JH. Restart the game to use the change.", Note::Ok);
+                                        L") were copied into " + names2 + L". Restart the game to use the change.", Note::Ok);
                     }
                 }
                 else
