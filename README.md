@@ -16,7 +16,17 @@ OptiCaptureHost is a modified development fork exploring a Windows Graphics Capt
 - Motion vectors are estimated from captured color frames and depth is synthetic; they are not game-provided data.
 - Official OptiScaler V10 integration has not been verified. Native frame-generation-only passthrough is not implemented.
 - A compatible FidelityFX runtime may be supplied manually beside the executables to exercise the retained temporal scaffold. No runtime DLLs are included in this repository or the development ZIP.
-- Runtime smoke checks should cover capture with and without OptiScaler, target resize and close, and repeated start/stop. They require a Windows desktop and a suitable target application.
+
+## Manual runtime checks
+
+On a Windows desktop, use a disposable windowed target and check the following:
+
+1. With OptiScaler absent, start native capture, confirm the image and capture log, stop, and repeat start/stop.
+2. Try each scaled target size. Confirm the target resizes for capture and returns to its original size and placement after stop.
+3. Resize the target during capture, then close it during a separate run. Confirm the overlay follows geometry changes and the host exits cleanly when the target closes.
+4. Compare `OptiScaler.ini` before and after launcher start/stop to verify it remains unchanged.
+
+Keep official OptiScaler V10 interoperability and frame-generation checks separate; they are not established by this PR.
 
 For OptiScaler setup, obtain the official project and follow its own installation instructions: [optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler). This host does not install, update, or configure OptiScaler. Set source-game frame limits in the game itself; OptiScaler limits the host process.
 
