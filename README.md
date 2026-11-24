@@ -42,7 +42,7 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The executables are written to `build/Release`. The manually dispatched GitHub Actions workflow builds Windows x64 Release and uploads one ZIP containing both executables, this README, the GPL license, the notice, and the retained FidelityFX license.
+The executables are written to `build/Release`. GitHub Actions compiles both executables for pull requests targeting `feature/optiscaler-upstream` or `refactor/upstream-provider-cleanup`; PR builds do not upload artifacts. To package a development ZIP, use **Actions → build → Run workflow**. The manual run uploads one ZIP containing both executables, this README, the GPL license, the notice, and the retained FidelityFX license. GitHub Actions must be enabled for this fork under **Settings → Actions → General** for these workflows to run.
 
 ## License and provenance
 
