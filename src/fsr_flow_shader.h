@@ -1,4 +1,4 @@
-// Motion vectors measured from the captured frames themselves, for the FSR3/4 output scaling (Upscale method 4).
+// Optical flow estimated from consecutive captured frames for the retained temporal scaffold.
 // Two compute passes:
 //   1) every 4x4 block finds where its 8x8 neighbourhood was in the frame before: coarse search (+-24, step 6), then step 3 and step 1
 //      around the best, then a sub-pixel (parabola) refinement; blocks that did not change at all (a HUD) are not searched.
@@ -156,7 +156,7 @@ void CSPixel(uint3 id : SV_DispatchThreadID)
     uMv[id.xy] = best; // sub-pixel, not rounded
     uDepth[id.xy] = 0.5; // the capture has no depth: flat, as before
     // Where even the best vector leaves the 3x3 surroundings unlike the frame before (uncovered background, effects, a wrong
-    // estimate) the upscaler is told to lean on this frame instead of smearing its history (less ghosting and shimmer in a fast turn).
+    // estimate) temporal processing can prefer this frame over unreliable history during a fast turn.
     const float sad = max(bestCost - 0.015 * length(best), 0.0);
     uReact[id.xy] = 0.8 * saturate((sad / 9.0 - 0.04) / 0.15);
 }

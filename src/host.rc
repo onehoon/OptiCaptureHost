@@ -14,15 +14,15 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "MK-JH"
-            VALUE "FileDescription", "Telegram channel: @MKJH_APPS"
+            VALUE "CompanyName", "OptiCaptureHost contributors"
+            VALUE "FileDescription", "OptiCaptureHost window capture and D3D12 display host"
             VALUE "FileVersion", OC_VER_STR
             VALUE "InternalName", "OptiCaptureHost"
             VALUE "LegalCopyright", "Copyright (C) MK-JH"
             VALUE "OriginalFilename", "OptiCaptureHost.exe"
             VALUE "ProductName", "OptiCaptureHost"
             VALUE "ProductVersion", OC_VER_STR
-            VALUE "Comments", "Telegram channel: @MKJH_APPS"
+            VALUE "Comments", "Modified development fork, 2026-11-24"
         END
     END
     BLOCK "VarFileInfo"

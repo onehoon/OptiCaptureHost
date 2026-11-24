@@ -1,29 +1,10 @@
 // OptiCaptureHost
-//
-// A small D3D12 "host" application. It captures one window with Windows Graphics Capture and shows the picture,
-// 1:1, in a borderless click-through overlay window that sits exactly on top of the captured window.
-//
-// It contains no upscaler and no frame generation of its own. The idea is to put OptiScaler (renamed to dxgi.dll)
-// next to this exe: OptiScaler then sees a D3D12 "game" that makes no DLSS/FSR/XeSS call and can run its native
-// input path (optical flow, FSR pass, XeFG frame generation, XeLL) on the captured picture. The captured game
-// itself is never hooked or modified.
-//
-// Pipeline per frame:
-//   WGC frame (D3D11 texture) -> CopySubresourceRegion into a shared texture -> shared fence ->
-//   D3D12 queue waits -> CopyResource into the swap chain back buffer -> Present
-//
-// Hotkeys:  Ctrl+Shift+F12  quit
-//           Ctrl+Shift+F11  toggle click-through (turn it off to use the OptiScaler menu with the mouse)
-//           Ctrl+Shift+F10  open / close the OptiScaler menu
-// (all changeable, together with VSync, in OptiCaptureLauncher.exe, which stores them in OptiCaptureHost.ini; this
-// exe re-reads that file while it runs.)
+// OptiCaptureHost captures one window with Windows Graphics Capture and displays it in a
+// borderless D3D12 overlay. Its FFX optical-flow and temporal scaffold is retained for follow-up work.
 
 #include <windows.h>
 #include <shellapi.h>
-#include <shellscalingapi.h>
-#include <timeapi.h>
 #include <tlhelp32.h>
-#include <avrt.h>
 #include <dwmapi.h>
 
 #include <d3d11_4.h>
@@ -50,31 +31,20 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cwctype>
-#include <fstream>
 #include <mutex>
-#include <cmath>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "settings.h"
-#include "upscale_shader.h"
-#include "nis_shader.h"
-#include "nis_config.h"
+#include "blit_shader.h"
 #include "fsr_flow_shader.h"
 #include "ffx_api/ffx_api.h"
 #include "ffx_api/ffx_upscale.h"
 #include "ffx_api/ffx_api_loader.h"
 #include "ffx_api/dx12/ffx_api_dx12.h"
-#ifdef OC_HAVE_NGX
-#include "nvsdk_ngx.h"
-#include "nvsdk_ngx_defs.h"
-#include "nvsdk_ngx_params.h"
-#endif
 
 #pragma comment(lib, "d3dcompiler.lib")
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "avrt.lib")
 
 using Microsoft::WRL::ComPtr;
 namespace wgc = winrt::Windows::Graphics::Capture;
@@ -160,71 +130,7 @@ std::string Narrow(const std::wstring& w)
     return s;
 }
 
-// While the game is the foreground window, Windows (Game Mode, background / efficiency throttling, the GPU scheduler)
-// favours the game over every other process, and this host is "another process". The host must never be starved:
-// it presents every frame of the picture (and OptiScaler's frame generation runs inside it). So raise its CPU and
-// GPU priority and switch off the throttling Windows applies to background processes.
-// Performance level (OptiCaptureHost.ini [Advanced] Boost, set in the launcher):
-//   0 = nothing changed        1 = CPU priority, MMCSS, no power throttling, 1 ms timer
-//   2 = 1 + GPU priority class HIGH and a high-priority D3D12 queue
-//   3 = 1 + GPU priority class REALTIME (administrator; HIGH without it) and a high-priority D3D12 queue (default)
-// A very high GPU priority helps on strong GPUs, but on a weak GPU it can starve the game itself (and with it the
-// capture), so weaker cards should use a lower level.
-int g_boost = 3;
-
-void BoostProcess(int level)
-{
-    g_boost = std::clamp(level, 0, 3);
-    Log("Performance level %d", g_boost);
-    if (g_boost == 0)
-        return;
-
-    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
-        Log("SetPriorityClass(HIGH) failed: %lu", GetLastError());
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-
-    DWORD task = 0;
-    HANDLE mm = AvSetMmThreadCharacteristicsW(L"Games", &task);
-    Log("MMCSS (Games) %s", mm ? "on" : "unavailable");
-
-    PROCESS_POWER_THROTTLING_STATE pt{};
-    pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-    pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-    pt.StateMask = 0; // 0 = throttling off for both
-    if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt)))
-        Log("Could not switch off power throttling: %lu", GetLastError());
-
-    timeBeginPeriod(1);
-
-    // GPU scheduling class of the whole process (REALTIME needs administrator rights, HIGH does not).
-    using SetClassFn = LONG(WINAPI*)(HANDLE, int);
-    if (g_boost >= 2)
-    if (HMODULE gdi = LoadLibraryW(L"gdi32.dll"))
-    {
-        auto fn = reinterpret_cast<SetClassFn>(GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"));
-        if (fn)
-        {
-            LONG st = 1;
-            if (g_boost >= 3)
-                st = fn(GetCurrentProcess(), 5); // REALTIME
-            if (st != 0)
-                st = fn(GetCurrentProcess(), 4); // HIGH
-            Log("GPU scheduling priority class request: NTSTATUS 0x%08X (%s)", static_cast<unsigned>(st), st == 0 ? "ok" : "refused");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Focus spoof
-// ---------------------------------------------------------------------------------------------------------------
-// Measured: with the overlay focused, every captured frame becomes two presented frames; as soon as the game has the
-// focus (Ctrl+Shift+F11) the presents drop to one per captured frame, i.e. frame generation silently stops. Something
-// in the chain (DLSS-G / the Enabler, OptiScaler) only generates frames while the window it presents to is the
-// foreground window, and during play the foreground window has to be the game so that it gets keyboard and mouse.
-//
-// So the modules loaded in this process (OptiScaler, the frame generation DLLs, ...) are told a small lie: while the
-// game is the real foreground window, their GetForegroundWindow() returns our overlay. This is done by replacing that
-// entry in their import tables; this exe's own code (and Windows itself) keep seeing the truth.
+// Keep foreground-window interception local to modules loaded in this host process. The target game is not patched.
 using GetForegroundFn = HWND(WINAPI*)();
 GetForegroundFn g_realGetForeground = nullptr;
 HWND g_spoofTarget = nullptr;
@@ -332,65 +238,35 @@ bool GetTargetBounds(HWND target, RECT& r)
 
 struct Options
 {
-    std::wstring title;      // --title <text>: capture the first visible window whose title contains this
-    int delaySec = 5;        // --delay <s>: without --title, capture the foreground window after this many seconds
-    bool vsync = true;       // --vsync 0|1
-    int buffers = 3;         // --buffers 2..4
-    int overlayAlpha = 254;  // [Advanced] OverlayAlpha 1..255: below 255 DWM must blend the overlay (no direct flip)
-    int affinity = 0;        // [Advanced] Affinity: 0 off, 1 WDA_MONITOR, 2 WDA_EXCLUDEFROMCAPTURE (forces DWM composition)
-    double paceK = 1.0;      // [Advanced] PaceK: host frames are PaceK / refresh apart with VSync + Arthur (default 1 = base rate equals the refresh rate; 0 = measured from the FG multiplier)
-    int startDelayMs = 1500; // [Advanced] StartDelayMs: pause before the swap chain is created
-    int testMode = 0; // [Advanced] TestMode: 1 = capture only (nothing is shown), 2 = show without copying new frames (diagnostics)
-    bool noLayered = false; // [Advanced] NoLayered=1 (test only): plain overlay window, no layered style, so no click-through
-    bool probe = false; // [Advanced] Probe=1: compare small patches of every frame (diagnostic, costs a little GPU time)
-    double presentDelayMs = 0.0; // [Advanced] PresentDelayMs: hold each frame this long before Present (keeps it off the DWM compose boundary)
-    int gpu = -1;            // --gpu <index>: DXGI adapter index (default: high-performance adapter)
-    bool clickThrough = true; // --no-clickthrough
-    int menuKey = VK_INSERT;  // --menu-key <vk>: the key that opens OptiScaler's menu (e.g. 0x2D, its default, Insert)
-    HWND hwnd = nullptr;      // --hwnd <n>: capture exactly this window (what the launcher passes)
-    DWORD parent = 0;         // --parent <pid>: the launcher; quit when it is gone
+    std::wstring title;
+    int delaySec = 5;
+    bool clickThrough = true;
+    int menuKey = VK_INSERT;
+    HWND hwnd = nullptr;
+    DWORD parent = 0;
 };
 
 bool ParseOptions(Options& o)
 {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv)
-        return false;
-
+    if (!argv) return false;
     bool ok = true;
     for (int i = 1; i < argc; ++i)
     {
-        std::wstring a = argv[i];
-        auto next = [&]() -> std::wstring { return (i + 1 < argc) ? std::wstring(argv[++i]) : std::wstring(); };
-
-        if (a == L"--title")
-            o.title = next();
-        else if (a == L"--delay")
-            o.delaySec = std::clamp(_wtoi(next().c_str()), 0, 120);
-        else if (a == L"--vsync")
-            o.vsync = _wtoi(next().c_str()) != 0;
-        else if (a == L"--buffers")
-            o.buffers = std::clamp(_wtoi(next().c_str()), 2, 4);
-        else if (a == L"--gpu")
-            o.gpu = _wtoi(next().c_str());
-        else if (a == L"--no-clickthrough")
-            o.clickThrough = false;
-        else if (a == L"--hwnd")
-            o.hwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(_wcstoui64(next().c_str(), nullptr, 10)));
-        else if (a == L"--parent")
-            o.parent = static_cast<DWORD>(_wtoi64(next().c_str()));
-        else if (a == L"--menu-key")
-            o.menuKey = std::clamp(static_cast<int>(wcstol(next().c_str(), nullptr, 0)), 1, 254);
-        else
-            ok = false;
+        std::wstring arg = argv[i];
+        auto next = [&]() { return i + 1 < argc ? std::wstring(argv[++i]) : std::wstring(); };
+        if (arg == L"--title") o.title = next();
+        else if (arg == L"--delay") o.delaySec = std::clamp(_wtoi(next().c_str()), 0, 120);
+        else if (arg == L"--no-clickthrough") o.clickThrough = false;
+        else if (arg == L"--hwnd") o.hwnd = reinterpret_cast<HWND>(static_cast<ULONG_PTR>(_wcstoui64(next().c_str(), nullptr, 10)));
+        else if (arg == L"--parent") o.parent = static_cast<DWORD>(_wtoi64(next().c_str()));
+        else if (arg == L"--menu-key") o.menuKey = std::clamp(static_cast<int>(wcstol(next().c_str(), nullptr, 0)), 1, 254);
+        else ok = false;
     }
-
     LocalFree(argv);
     return ok;
 }
-
-// ---------------------------------------------------------------------------------------------------------------
 // Window picking
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -465,35 +341,6 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-LRESULT CALLBACK LabelProc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    if (m == WM_ERASEBKGND)
-        return 1;
-    if (m == WM_PAINT)
-    {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        RECT rc;
-        GetClientRect(h, &rc);
-        HBRUSH bg = CreateSolidBrush(RGB(12, 12, 16));
-        FillRect(dc, &rc, bg);
-        DeleteObject(bg);
-        wchar_t t[64] = {};
-        GetWindowTextW(h, t, 64);
-        HFONT f = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old = SelectObject(dc, f);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(120, 255, 140));
-        DrawTextW(dc, t, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, old);
-        DeleteObject(f);
-        EndPaint(h, &ps);
-        return 0;
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
 class Host
 {
   public:
@@ -507,17 +354,13 @@ class Host
     bool InitGraphics();
     bool InitCapture();
     bool InitOverlayAndSwapChain();
-    bool InitUpscale();
-    bool CreateUpscaleViews();
+    bool InitBlit();
+    bool CreateFsrViews();
     bool InitFsrPipelines();
     bool InitFsrTemporal();
     void ReleaseFsrTemporal();
-    void RecordFsrTemporal();
-    bool InitDlss();
-    void ReleaseDlssFeature();
-    void ShutdownDlss();
-    bool RecordDlss(ID3D12Resource* curTex, bool reset);
-    void RecordUpscale(ID3D12Resource* bb, UINT idx);
+    bool RecordFsrTemporal();
+    void RecordBlit(ID3D12Resource* bb, UINT idx, bool temporalOutput);
     void OverlayPlace(const RECT& game, int& x, int& y);
     bool CreateShared();
     bool PresentFrame(ID3D11Texture2D* src);
@@ -526,8 +369,6 @@ class Host
     bool RefreshGeometry();
     void LogGeometry();
     void MoveOverlay();
-    void CreateLabel();
-    void UpdateLabel();
     void EnforceOverlayStyle();
     void ToggleInteractive();
     bool ForceForeground(HWND h);
@@ -544,30 +385,15 @@ class Host
     HINSTANCE inst_ = nullptr;
     UINT width_ = 0;
     UINT height_ = 0;
-    // Output scaling (Upscale): the swap chain and the overlay are monitor sized and the captured picture is scaled up
-    // to them on the GPU (bilinear or FSR 1: EASU + RCAS). Without it outW_/outH_ equal width_/height_.
-    bool upOn_ = false;
-    HWND label_ = nullptr; // small "720 to 1080" note in the monitor corner, shown for a few seconds
-    std::chrono::steady_clock::time_point labelUntil_{};
-    bool labelAlways_ = false;
-    UINT labelH_ = 0; // captured height the label shows (it changes when the game window is resized)
-    int upMethod_ = 0; // method chosen at start (1 bilinear, 2 FSR 1, 3 NIS); the sharpness values are read live
+    // Resolution choices resize the target window in the launcher; scaled choices use this neutral bilinear blit.
+    bool scaleOn_ = false;
+    bool blitReady_ = false;
     UINT outW_ = 0;
     UINT outH_ = 0;
-    ComPtr<ID3D12RootSignature> upRoot_;
-    ComPtr<ID3D12PipelineState> upPsoBil_, upPsoEasu_, upPsoRcas_;
-    ComPtr<ID3D12DescriptorHeap> upSrvHeap_, upRtvHeap_;
-    ComPtr<ID3D12Resource> upMid_;
-    // NIS (NVIDIA Image Scaling): compute shader writes nisOut_, a pixel shader copies it to the back buffer.
-    ComPtr<ID3D12RootSignature> nisRoot_;
-    ComPtr<ID3D12PipelineState> nisPso_;
-    ComPtr<ID3D12Resource> nisOut_, nisCoef_[2], nisUpload_;
-    bool nisCoefDone_ = false;
-    // Temporal FSR (Upscale method 4): motion measured from the captured frames, AMD's FidelityFX runtime does the upscaling.
-    // DLSS (NVIDIA NGX): runs on the same motion / depth / mask textures as FSR3/4
-    void* ngxParams_ = nullptr;  // NVSDK_NGX_Parameter*
-    void* ngxFeature_ = nullptr; // NVSDK_NGX_Handle*
-    bool ngxInit_ = false;
+    ComPtr<ID3D12RootSignature> blitRoot_;
+    ComPtr<ID3D12PipelineState> blitPso_;
+    ComPtr<ID3D12DescriptorHeap> srvHeap_, rtvHeap_;
+    // The FFX context consumes estimated vectors/depth and writes its temporal output for display.
     HMODULE ffxModule_ = nullptr;
     ffxFunctions ffxFn_{};
     ffxContext ffxCtx_ = nullptr;
@@ -577,10 +403,11 @@ class Host
     bool fsrPipesOk_ = false;
     bool fsrReady_ = false;
     bool fsrHavePrev_ = false;
+    bool ffxUnavailableLogged_ = false;
     int fsrCur_ = 1;
     std::chrono::steady_clock::time_point fsrLast_{};
-    UINT upSrvInc_ = 0;
-    UINT upRtvInc_ = 0;
+    UINT srvInc_ = 0;
+    UINT rtvInc_ = 0;
     bool interactive_ = false;
     int menuKeyStage_ = 0; // 0 idle, 1 waiting to press the menu key, 2 waiting to release it
     std::chrono::steady_clock::time_point menuKeyAt_{};
@@ -589,10 +416,7 @@ class Host
     std::chrono::steady_clock::time_point keepGameUntil_{};
     std::chrono::steady_clock::time_point keepGameCheck_{};
     void KeepGameVisible(std::chrono::steady_clock::time_point now);
-    bool tearing_ = false;
     UINT swapFlags_ = 0;
-    HANDLE waitable_ = nullptr; // Lossless-style mode: swap chain frame latency waitable object (owned, closed at shutdown)
-    int waitTimeouts_ = 0;
     RECT lastBounds_ = {};
     UINT capW_ = 0; // size of the captured frame (the whole window)
     UINT capH_ = 0;
@@ -616,17 +440,6 @@ class Host
     ComPtr<IDXGISwapChain3> swap_;
     std::vector<ComPtr<ID3D12CommandAllocator>> allocs_;
     std::vector<UINT64> allocFence_;
-    // VSync pacing (Arthur): each host frame makes k presents and the Arthur path ignores the sync interval, so the
-    // host spaces its own frames k / refresh apart. k is measured from DXGI present counts.
-    ComPtr<IDXGIOutput> paceOutput_;
-    double refreshHz_ = 0.0;
-    double pacePerFrame_ = 1.0;
-    UINT paceLastPresents_ = 0;
-    UINT64 paceFrames_ = 0;
-    std::chrono::steady_clock::time_point paceStatAt_{};
-    std::chrono::steady_clock::time_point paceLast_{};
-    std::chrono::steady_clock::time_point halfNext_{}; // present mode 5: when the next base frame is due
-    bool halfSkip_ = false;                           // present mode 5: the last turn found no new frame, do not wait again
     double waitMs_ = 0.0;    // stats: time spent waiting for the allocator fence / inside Present, per 5 s
     double presentMs_ = 0.0;
 
@@ -637,10 +450,6 @@ class Host
     UINT64 liveFrames_ = 0;
     double liveWait_ = 0.0;
     double livePresent_ = 0.0;
-    UINT liveDxgiPresents_ = 0;
-    bool liveDxgiValid_ = false;
-    int lastInterval_ = 0;
-    std::vector<double> capHist_; // the last capture rates, to tell a capped game from a slow one
 
     // Frame time diagnostics, logged every 5 s: gaps between captured frames and between the host's presents, and the
     // longest time the housekeeping (focus spoof scan, window checks) kept the presenting thread busy.
@@ -651,12 +460,6 @@ class Host
     std::vector<double> latMs_; // age of the captured frame (Windows composed it) when the host hands it to Present
     std::vector<double> srcGaps_; // gaps between the capture time stamps Windows put on the frames
     long long lastSrc100ns_ = 0;
-    ComPtr<ID3D11Texture2D> probe_[2]; // tiny staging copies of 32 screen patches: tells whether the picture really changed
-    bool probeValid_[2] = { false, false };
-    int probeIdx_ = 0;
-    unsigned long long lastHash_ = 0;
-    bool haveHash_ = false;
-    int contentNew_ = 0, contentRep_ = 0, repRun_ = 0, repMax_ = 0;
     // GPU time of the host's own copies (measured with timestamp queries)
     ComPtr<ID3D12QueryHeap> tsHeap_;
     ComPtr<ID3D12Resource> tsRead_;
@@ -708,10 +511,7 @@ bool Host::InitGraphics()
         return false;
     }
 
-    if (opt_.gpu >= 0)
-        hr = factory_->EnumAdapters1(static_cast<UINT>(opt_.gpu), &adapter_);
-    else
-        hr = factory_->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter_));
+    hr = factory_->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter_));
     if (FAILED(hr))
     {
         Log("No adapter found: 0x%08X", static_cast<unsigned>(hr));
@@ -731,7 +531,6 @@ bool Host::InitGraphics()
 
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qd.Priority = g_boost >= 2 ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
     hr = dev12_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
     if (FAILED(hr))
         return false;
@@ -749,12 +548,6 @@ bool Host::InitGraphics()
     {
         Log("D3D11CreateDevice failed: 0x%08X", static_cast<unsigned>(hr));
         return false;
-    }
-
-    {
-        ComPtr<IDXGIDevice> d;
-        if (g_boost >= 2 && SUCCEEDED(dev11_.As(&d)))
-            d->SetGPUThreadPriority(7);
     }
 
     ComPtr<ID3D11Device5> dev11_5;
@@ -782,10 +575,6 @@ bool Host::InitGraphics()
         Log("OpenSharedHandle (fence) failed: 0x%08X", static_cast<unsigned>(hr));
         return false;
     }
-
-    BOOL allow = FALSE;
-    if (SUCCEEDED(factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))))
-        tearing_ = allow != FALSE;
 
     return true;
 }
@@ -849,24 +638,15 @@ bool Host::InitCapture()
     {
         Log("IsCursorCaptureEnabled not available");
     }
-    // Windows 11 captures at most one frame per MinUpdateInterval, which defaults to 1/60 s. On a 75 Hz or faster
-    // display that drops every other frame (75 Hz -> 37.5 fps), so ask for every frame DWM composes.
-    // Classic mode (Present mode 3, the 2.2.0 behaviour) leaves the Windows default, which caps capture at 60 fps.
-    if (st_.presentMode != 3)
+    // Ask Windows Graphics Capture for each frame DWM composes.
+    try
     {
-        try
-        {
-            session_.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{ 10000 }); // 1 ms
-            Log("Capture MinUpdateInterval set to 1 ms");
-        }
-        catch (...)
-        {
-            Log("MinUpdateInterval not available (older Windows): capture may be limited to 60 fps");
-        }
+        session_.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{ 10000 }); // 1 ms
+        Log("Capture MinUpdateInterval set to 1 ms");
     }
-    else
+    catch (...)
     {
-        Log("Classic mode: capture left at the Windows default rate");
+        Log("MinUpdateInterval not available (older Windows): capture may be limited to 60 fps");
     }
     try
     {
@@ -889,86 +669,65 @@ bool Host::InitOverlayAndSwapChain()
     wc.lpszClassName = L"OptiCaptureHostOverlay";
     RegisterClassExW(&wc);
 
-    RECT r{};
-    GetTargetBounds(target_, r);
-    lastBounds_ = r;
-
-    // Output scaling: monitor sized swap chain and overlay. Falls back to the normal 1:1 path if the shaders fail.
-    upOn_ = false;
+    RECT bounds{};
+    if (!GetTargetBounds(target_, bounds))
+        return false;
+    lastBounds_ = bounds;
+    scaleOn_ = st_.targetScale != 0;
     outW_ = width_;
     outH_ = height_;
-    if (st_.upscale != 0)
+    if (scaleOn_)
     {
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST), &mi))
-        {
-            outW_ = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
-            outH_ = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
-            upOn_ = InitUpscale();
-            upMethod_ = st_.upscale;
-        }
-        if (upOn_)
-        {
-            Log("Output scaling: %s, %ux%u -> %ux%u (sharpness %.2f)", st_.upscale == 1 ? "bilinear" : (st_.upscale == 3 ? "NIS" : (st_.upscale == 4 ? "FSR3/4" : (st_.upscale == 5 ? "DLSS" : "FSR 1"))), width_, height_,
-                outW_, outH_, ((st_.upscale >= 3) ? st_.nisSharp : st_.upscaleSharp) / 100.0);
-        }
-        else
-        {
-            outW_ = width_;
-            outH_ = height_;
-            Log("Output scaling could not start, running 1:1");
-        }
+        if (!GetMonitorInfoW(MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST), &mi))
+            return false;
+        outW_ = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
+        outH_ = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
     }
-    int ovX = 0, ovY = 0;
-    OverlayPlace(r, ovX, ovY);
+    blitReady_ = InitBlit();
+    if (!blitReady_)
+    {
+        if (scaleOn_)
+            return false;
+        Log("Neutral blit is unavailable; native capture remains on the raw path");
+    }
+    if (scaleOn_)
+        Log("Target resolution mode %d: neutral blit %ux%u -> %ux%u", st_.targetScale, width_, height_, outW_, outH_);
+    else
+    {
+        Log("Native target resolution: %ux%u", width_, height_);
+    }
 
-    DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (opt_.noLayered ? 0 : WS_EX_LAYERED);
-    if (opt_.clickThrough && !opt_.noLayered)
+    int x = 0, y = 0;
+    OverlayPlace(bounds, x, y);
+    DWORD ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+    if (opt_.clickThrough)
         ex |= WS_EX_TRANSPARENT;
     interactive_ = !opt_.clickThrough;
-
-    overlay_ = CreateWindowExW(ex, wc.lpszClassName, L"OptiCaptureHost", WS_POPUP, ovX, ovY, static_cast<int>(outW_),
+    overlay_ = CreateWindowExW(ex, wc.lpszClassName, L"OptiCaptureHost", WS_POPUP, x, y, static_cast<int>(outW_),
                                static_cast<int>(outH_), nullptr, nullptr, inst_, nullptr);
     if (!overlay_)
     {
         Log("CreateWindowEx failed: %lu", GetLastError());
         return false;
     }
-    if (!opt_.noLayered)
-        SetLayeredWindowAttributes(overlay_, 0, static_cast<BYTE>(opt_.overlayAlpha), LWA_ALPHA);
-    if (opt_.affinity == 1 || opt_.affinity == 2)
-    {
-        const BOOL ok = SetWindowDisplayAffinity(overlay_, opt_.affinity == 1 ? WDA_MONITOR : 0x00000011 /* WDA_EXCLUDEFROMCAPTURE */);
-        Log("Overlay display affinity %d: %s", opt_.affinity, ok ? "ok" : "failed");
-    }
+    SetLayeredWindowAttributes(overlay_, 0, 255, LWA_ALPHA);
 
-    // The tearing flag can only be chosen when the swap chain is created, so VSync off at start-up is what allows
-    // real tearing (lowest latency); switching VSync later in the launcher still changes the sync interval.
-    // Lossless-style mode (Present mode 4): always create the swap chain with tearing allowed and a latency waitable
-    // object, like Lossless Scaling does, so the sync interval and the frame queue can be chosen freely.
-    const bool lsMode = st_.presentMode == 4;
-    swapFlags_ = ((!opt_.vsync || lsMode) && tearing_) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    if (lsMode)
-        swapFlags_ |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-
+    swapFlags_ = 0;
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = outW_;
     sd.Height = outH_;
     sd.Format = kFormat;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = static_cast<UINT>(opt_.buffers);
+    sd.BufferCount = 3;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Scaling = DXGI_SCALING_STRETCH;
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     sd.Flags = swapFlags_;
 
     ComPtr<IDXGISwapChain1> sc1;
-    // The first run after the launcher starts can fail here, while OptiScaler and the frame generation libraries inside
-    // this process are still starting up; later runs are fine. A short pause before the first try, and a few retries,
-    // make the first run work too. [Advanced] StartDelayMs in OptiCaptureHost.ini changes the pause (default 1500).
-    Sleep(static_cast<DWORD>(opt_.startDelayMs));
     HRESULT hr = E_FAIL;
     for (int attempt = 1; attempt <= 6; ++attempt)
     {
@@ -988,22 +747,11 @@ bool Host::InitOverlayAndSwapChain()
     if (FAILED(sc1.As(&swap_)))
         return false;
 
-    if (lsMode)
-    {
-        const HRESULT lh = swap_->SetMaximumFrameLatency(1);
-        waitable_ = FAILED(lh) ? nullptr : swap_->GetFrameLatencyWaitableObject();
-        Log("Lossless-style mode: frame latency 1 %s, waitable object %s, tearing %s, %u buffers",
-            FAILED(lh) ? "FAILED" : "ok", waitable_ ? "ok" : "missing",
-            (swapFlags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? "allowed" : "not available", sd.BufferCount);
-    }
-
     allocs_.resize(sd.BufferCount);
     allocFence_.assign(sd.BufferCount, 0);
-    for (auto& a : allocs_)
-    {
-        if (FAILED(dev12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))))
+    for (auto& allocator : allocs_)
+        if (FAILED(dev12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
             return false;
-    }
     if (FAILED(dev12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs_[0].Get(), nullptr, IID_PPV_ARGS(&list_))))
         return false;
     list_->Close();
@@ -1034,80 +782,87 @@ bool Host::InitOverlayAndSwapChain()
             tsRead_.Reset();
         }
     }
-
     ShowWindow(overlay_, SW_SHOWNOACTIVATE);
-    if (!CreateShared())
+    return CreateShared();
+}
+
+bool Host::InitBlit()
+{
+    if (!srvHeap_)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
+        srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srvHeap.NumDescriptors = 17;
+        srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(dev12_->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&srvHeap_))))
+            return false;
+        srvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.OffsetInDescriptorsFromTableStart = 0;
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &range;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 1;
+    rs.pParameters = &parameter;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> signature, error;
+    HRESULT hr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+    if (FAILED(hr) || FAILED(dev12_->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&blitRoot_))))
+    {
+        Log("Blit root signature failed: 0x%08X", static_cast<unsigned>(hr));
         return false;
-    if (upOn_)
-        CreateLabel();
+    }
+    const char* source = kBlitHlsl;
+    const SIZE_T sourceLength = sizeof(kBlitHlsl) - 1;
+    ComPtr<ID3DBlob> vs, ps, compileError;
+    hr = D3DCompile(source, sourceLength, "blit.hlsl", nullptr, nullptr, "VSMain", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs,
+                    &compileError);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(source, sourceLength, "blit.hlsl", nullptr, nullptr, "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps,
+                        &compileError);
+    if (FAILED(hr))
+    {
+        Log("Blit shader failed: 0x%08X %s", static_cast<unsigned>(hr),
+            compileError ? static_cast<const char*>(compileError->GetBufferPointer()) : "");
+        return false;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = blitRoot_.Get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = kFormat;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(dev12_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blitPso_))))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap.NumDescriptors = 32;
+    if (FAILED(dev12_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_))))
+        return false;
+    rtvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     return true;
 }
-
-void Host::CreateLabel()
-{
-    if (st_.labelSeconds <= 0)
-        return;
-    WNDCLASSEXW wc{};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = LabelProc;
-    wc.hInstance = inst_;
-    wc.lpszClassName = L"OptiCaptureHostLabel";
-    RegisterClassExW(&wc);
-
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST), &mi))
-        return;
-    static const wchar_t* names[] = { L"", L"bilinear", L"FSR 1", L"NIS", L"FSR3/4", L"DLSS" };
-    wchar_t text[64];
-    labelH_ = height_;
-    static const wchar_t* const lvNames[] = { L"Quality", L"Balanced", L"Performance", L"Native" };
-    swprintf(text, 64, L"%u to %u  (%s \u00B7 %s)", height_, outH_, names[(upMethod_ >= 0 && upMethod_ <= 5) ? upMethod_ : 0],
-             lvNames[(st_.upscaleLevel >= 0 && st_.upscaleLevel <= 3) ? st_.upscaleLevel : 0]);
-    label_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT, wc.lpszClassName,
-                             text, WS_POPUP, mi.rcMonitor.left + 16, mi.rcMonitor.top + 16, 400, 40, nullptr, nullptr, inst_, nullptr);
-    if (!label_)
-        return;
-    SetLayeredWindowAttributes(label_, 0, 215, LWA_ALPHA);
-    ShowWindow(label_, SW_SHOWNOACTIVATE);
-    labelAlways_ = st_.labelSeconds >= 999;
-    labelUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(st_.labelSeconds);
-}
-
-void Host::UpdateLabel()
-{
-    // The label always shows what really is being captured: when the game changes its picture size, show it again.
-    if (upOn_ && st_.labelSeconds > 0 && height_ != labelH_)
-    {
-        if (label_)
-        {
-            static const wchar_t* names[] = { L"", L"bilinear", L"FSR 1", L"NIS", L"FSR3/4", L"DLSS" };
-            wchar_t text[64];
-            labelH_ = height_;
-            static const wchar_t* const lvNames[] = { L"Quality", L"Balanced", L"Performance", L"Native" };
-    swprintf(text, 64, L"%u to %u  (%s \u00B7 %s)", height_, outH_, names[(upMethod_ >= 0 && upMethod_ <= 5) ? upMethod_ : 0],
-             lvNames[(st_.upscaleLevel >= 0 && st_.upscaleLevel <= 3) ? st_.upscaleLevel : 0]);
-            SetWindowTextW(label_, text);
-            InvalidateRect(label_, nullptr, TRUE);
-            labelUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(st_.labelSeconds);
-        }
-        else
-        {
-            CreateLabel();
-        }
-    }
-    if (!label_)
-        return;
-    if (!labelAlways_ && std::chrono::steady_clock::now() > labelUntil_)
-    {
-        DestroyWindow(label_);
-        label_ = nullptr;
-        return;
-    }
-    // stay above the overlay
-    SetWindowPos(label_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-}
-
 bool Host::CreateShared()
 {
     shared11_.Reset();
@@ -1150,16 +905,21 @@ bool Host::CreateShared()
         Log("OpenSharedHandle (texture) failed: 0x%08X", static_cast<unsigned>(hr));
         return false;
     }
-    if (upOn_ && !CreateUpscaleViews())
+    if (!fsrPipesOk_)
+    {
+        fsrPipesOk_ = InitFsrPipelines();
+        if (!fsrPipesOk_)
+            Log("FFX optical-flow shaders are unavailable; capture remains on the raw path");
+    }
+    if (srvHeap_ && !CreateFsrViews())
         return false;
     return true;
 }
 
-// ---- Output scaling ---------------------------------------------------------------------------------------------
-// Where the overlay window goes: on the game's picture, or, with output scaling, over the whole monitor the game is on.
+// The scaled display covers the target monitor; native mode stays over the target window.
 void Host::OverlayPlace(const RECT& game, int& x, int& y)
 {
-    if (upOn_)
+    if (scaleOn_)
     {
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
@@ -1174,292 +934,19 @@ void Host::OverlayPlace(const RECT& game, int& x, int& y)
     y = game.top + cropY_;
 }
 
-bool Host::InitUpscale()
-{
-    upRoot_.Reset();
-    upPsoBil_.Reset();
-    upPsoEasu_.Reset();
-    upPsoRcas_.Reset();
-    upSrvHeap_.Reset();
-    upRtvHeap_.Reset();
-    upMid_.Reset();
-
-    // Root signature: 16 root constants (b0) and one SRV table (t0), static linear clamp sampler (s0).
-    D3D12_DESCRIPTOR_RANGE range{};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    D3D12_ROOT_PARAMETER rp[2]{};
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[0].Constants.Num32BitValues = 16;
-    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[1].DescriptorTable.NumDescriptorRanges = 1;
-    rp[1].DescriptorTable.pDescriptorRanges = &range;
-    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC ss{};
-    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    ss.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    ss.MaxLOD = D3D12_FLOAT32_MAX;
-    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 2;
-    rsd.pParameters = rp;
-    rsd.NumStaticSamplers = 1;
-    rsd.pStaticSamplers = &ss;
-    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
-                D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
-    ComPtr<ID3DBlob> sig, err;
-    HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
-    if (FAILED(hr))
-    {
-        Log("Upscale: root signature failed: 0x%08X", static_cast<unsigned>(hr));
-        return false;
-    }
-    hr = dev12_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&upRoot_));
-    if (FAILED(hr))
-    {
-        Log("Upscale: CreateRootSignature failed: 0x%08X", static_cast<unsigned>(hr));
-        return false;
-    }
-
-    // Shaders (FSR 1 source from AMD FidelityFX, MIT licence), compiled once at start.
-    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
-        ComPtr<ID3DBlob> e;
-        const HRESULT h = D3DCompile(kUpscaleHlsl, kUpscaleHlslLen, "upscale.hlsl", nullptr, nullptr, entry, target,
-                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &out, &e);
-        if (FAILED(h))
-        {
-            Log("Upscale: shader %s failed: 0x%08X %s", entry, static_cast<unsigned>(h),
-                e ? static_cast<const char*>(e->GetBufferPointer()) : "");
-            return false;
-        }
-        return true;
-    };
-    ComPtr<ID3DBlob> vs, psB, psE, psR;
-    if (!compile("VSMain", "vs_5_0", vs) || !compile("PSBilinear", "ps_5_0", psB) || !compile("PSEasu", "ps_5_0", psE) ||
-        !compile("PSRcas", "ps_5_0", psR))
-        return false;
-
-    auto makePso = [&](ID3DBlob* ps, ComPtr<ID3D12PipelineState>& pso) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = upRoot_.Get();
-        pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-        pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = kFormat;
-        pd.SampleDesc.Count = 1;
-        const HRESULT h = dev12_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
-        if (FAILED(h))
-            Log("Upscale: CreateGraphicsPipelineState failed: 0x%08X", static_cast<unsigned>(h));
-        return SUCCEEDED(h);
-    };
-    if (!makePso(psB.Get(), upPsoBil_) || !makePso(psE.Get(), upPsoEasu_) || !makePso(psR.Get(), upPsoRcas_))
-        return false;
-
-    // Descriptor heaps: SRV 0 = the captured picture, SRV 1 = the EASU result; RTV 0 = the EASU result, 1.. = back buffers.
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 17; // 0 captured picture, 1-2 NIS coefficients, 3 EASU result, 4 NIS output (UAV), 5 NIS output (SRV),
-                            // 6 temporal FSR output (SRV), 7-9 flow inputs (frame A, B, block vectors), 10-13 flow outputs (UAV: block vectors, vectors, depth, reactive mask), 14-16 flow inputs (B, A, block vectors)
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(dev12_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&upSrvHeap_))))
-        return false;
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 1 + 32;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    if (FAILED(dev12_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&upRtvHeap_))))
-        return false;
-    upSrvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    upRtvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    // Intermediate picture at output size (EASU writes it, RCAS reads it).
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = outW_;
-    rd.Height = outH_;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = kFormat;
-    rd.SampleDesc.Count = 1;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    hr = dev12_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                                         IID_PPV_ARGS(&upMid_));
-    if (FAILED(hr))
-    {
-        Log("Upscale: intermediate texture failed: 0x%08X", static_cast<unsigned>(hr));
-        return false;
-    }
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = kFormat;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE h = upSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += static_cast<SIZE_T>(upSrvInc_) * 3;
-    dev12_->CreateShaderResourceView(upMid_.Get(), &sv, h);
-    dev12_->CreateRenderTargetView(upMid_.Get(), nullptr, upRtvHeap_->GetCPUDescriptorHandleForHeapStart());
-
-    if (st_.upscale == 3)
-    {
-        nisRoot_.Reset();
-        nisPso_.Reset();
-        nisOut_.Reset();
-        nisCoef_[0].Reset();
-        nisCoef_[1].Reset();
-        nisUpload_.Reset();
-        nisCoefDone_ = false;
-
-        D3D12_DESCRIPTOR_RANGE nr[2]{};
-        nr[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        nr[0].NumDescriptors = 3;
-        nr[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-        nr[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        nr[1].NumDescriptors = 1;
-        nr[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-        D3D12_ROOT_PARAMETER np[3]{};
-        np[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        np[0].Constants.Num32BitValues = 28;
-        np[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        np[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        np[1].DescriptorTable.NumDescriptorRanges = 1;
-        np[1].DescriptorTable.pDescriptorRanges = &nr[0];
-        np[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        np[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        np[2].DescriptorTable.NumDescriptorRanges = 1;
-        np[2].DescriptorTable.pDescriptorRanges = &nr[1];
-        np[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_STATIC_SAMPLER_DESC ns{};
-        ns.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        ns.AddressU = ns.AddressV = ns.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        ns.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        ns.MaxLOD = D3D12_FLOAT32_MAX;
-        ns.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC nrs{};
-        nrs.NumParameters = 3;
-        nrs.pParameters = np;
-        nrs.NumStaticSamplers = 1;
-        nrs.pStaticSamplers = &ns;
-        ComPtr<ID3DBlob> nsig, nerr;
-        if (FAILED(D3D12SerializeRootSignature(&nrs, D3D_ROOT_SIGNATURE_VERSION_1, &nsig, &nerr)) ||
-            FAILED(dev12_->CreateRootSignature(0, nsig->GetBufferPointer(), nsig->GetBufferSize(), IID_PPV_ARGS(&nisRoot_))))
-        {
-            Log("NIS: root signature failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> cs, ce;
-        const HRESULT ch = D3DCompile(kNisHlsl, kNisHlslLen, "nis.hlsl", nullptr, nullptr, "main", "cs_5_0",
-                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &ce);
-        if (FAILED(ch))
-        {
-            Log("NIS: shader failed: 0x%08X %s", static_cast<unsigned>(ch), ce ? static_cast<const char*>(ce->GetBufferPointer()) : "");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cd{};
-        cd.pRootSignature = nisRoot_.Get();
-        cd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
-        if (FAILED(dev12_->CreateComputePipelineState(&cd, IID_PPV_ARGS(&nisPso_))))
-        {
-            Log("NIS: CreateComputePipelineState failed");
-            return false;
-        }
-
-        // Coefficient textures (2 x 64 texels, RGBA32F), filled from the first frame's command list.
-        D3D12_RESOURCE_DESC cr{};
-        cr.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        cr.Width = kFilterSize / 4;
-        cr.Height = kPhaseCount;
-        cr.DepthOrArraySize = 1;
-        cr.MipLevels = 1;
-        cr.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        cr.SampleDesc.Count = 1;
-        for (int i = 0; i < 2; ++i)
-            if (FAILED(dev12_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &cr, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                       IID_PPV_ARGS(&nisCoef_[i]))))
-            {
-                Log("NIS: coefficient texture failed");
-                return false;
-            }
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-        UINT rows = 0;
-        UINT64 rowBytes = 0, total = 0;
-        dev12_->GetCopyableFootprints(&cr, 0, 1, 0, &fp, &rows, &rowBytes, &total);
-        D3D12_HEAP_PROPERTIES up{};
-        up.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC ur{};
-        ur.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        ur.Width = total * 2;
-        ur.Height = 1;
-        ur.DepthOrArraySize = 1;
-        ur.MipLevels = 1;
-        ur.SampleDesc.Count = 1;
-        ur.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(dev12_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &ur, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                   IID_PPV_ARGS(&nisUpload_))))
-            return false;
-        unsigned char* map = nullptr;
-        if (FAILED(nisUpload_->Map(0, nullptr, reinterpret_cast<void**>(&map))))
-            return false;
-        for (int i = 0; i < 2; ++i)
-        {
-            const float* src = i == 0 ? &coef_scale[0][0] : &coef_usm[0][0];
-            for (UINT y = 0; y < kPhaseCount; ++y)
-                memcpy(map + static_cast<size_t>(i) * total + static_cast<size_t>(y) * fp.Footprint.RowPitch, src + y * kFilterSize,
-                       kFilterSize * sizeof(float));
-        }
-        nisUpload_->Unmap(0, nullptr);
-
-        D3D12_SHADER_RESOURCE_VIEW_DESC cv{};
-        cv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        cv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        cv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        cv.Texture2D.MipLevels = 1;
-        for (int i = 0; i < 2; ++i)
-        {
-            D3D12_CPU_DESCRIPTOR_HANDLE ch2 = upSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-            ch2.ptr += static_cast<SIZE_T>(upSrvInc_) * (1 + i);
-            dev12_->CreateShaderResourceView(nisCoef_[i].Get(), &cv, ch2);
-        }
-
-        // Output picture of the compute pass (RGBA8: typed UAV stores are always supported for it).
-        D3D12_RESOURCE_DESC orr = rd;
-        orr.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        orr.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(dev12_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &orr, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                                                   IID_PPV_ARGS(&nisOut_))))
-        {
-            Log("NIS: output texture failed");
-            return false;
-        }
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-        uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        D3D12_CPU_DESCRIPTOR_HANDLE uh = upSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-        uh.ptr += static_cast<SIZE_T>(upSrvInc_) * 4;
-        dev12_->CreateUnorderedAccessView(nisOut_.Get(), nullptr, &uv, uh);
-        D3D12_SHADER_RESOURCE_VIEW_DESC ov = sv;
-        ov.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        D3D12_CPU_DESCRIPTOR_HANDLE oh = upSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-        oh.ptr += static_cast<SIZE_T>(upSrvInc_) * 5;
-        dev12_->CreateShaderResourceView(nisOut_.Get(), &ov, oh);
-    }
-    if (st_.upscale >= 4)
-        fsrPipesOk_ = InitFsrPipelines(); // on failure CreateUpscaleViews falls back to FSR 1
-    return true;
-}
-
-// FSR3/4: the two compute passes that measure motion (fsr_flow_shader.h).
+// FFX flow: the two compute passes that measure motion (fsr_flow_shader.h).
 bool Host::InitFsrPipelines()
 {
+    if (!srvHeap_)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.NumDescriptors = 17;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(dev12_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&srvHeap_))))
+            return false;
+        srvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
     fsrRoot_.Reset();
     fsrBlockPso_.Reset();
     fsrPixelPso_.Reset();
@@ -1486,7 +973,7 @@ bool Host::InitFsrPipelines()
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
         FAILED(dev12_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&fsrRoot_))))
     {
-        Log("FSR3/4: root signature failed");
+        Log("FFX flow: root signature failed");
         return false;
     }
     auto make = [&](const char* entry, ComPtr<ID3D12PipelineState>& pso) {
@@ -1496,7 +983,7 @@ bool Host::InitFsrPipelines()
                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e);
         if (FAILED(h))
         {
-            Log("FSR3/4: shader %s failed: 0x%08X %s", entry, static_cast<unsigned>(h),
+            Log("FFX flow: shader %s failed: 0x%08X %s", entry, static_cast<unsigned>(h),
                 e ? static_cast<const char*>(e->GetBufferPointer()) : "");
             return false;
         }
@@ -1505,7 +992,7 @@ bool Host::InitFsrPipelines()
         pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
         const HRESULT h2 = dev12_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
         if (FAILED(h2))
-            Log("FSR3/4: pipeline %s failed: 0x%08X", entry, static_cast<unsigned>(h2));
+            Log("FFX flow: pipeline %s failed: 0x%08X", entry, static_cast<unsigned>(h2));
         return SUCCEEDED(h2);
     };
     if (!(make("CSBlock", fsrBlockPso_) && make("CSPixel", fsrPixelPso_)))
@@ -1529,7 +1016,6 @@ void Host::ReleaseFsrTemporal()
     if (ffxCtx_ && ffxFn_.DestroyContext)
         ffxFn_.DestroyContext(&ffxCtx_, nullptr);
     ffxCtx_ = nullptr;
-    ReleaseDlssFeature();
     fsrTex_[0].Reset();
     fsrTex_[1].Reset();
     fsrBlk_.Reset();
@@ -1543,53 +1029,49 @@ void Host::ReleaseFsrTemporal()
 // context) is made again whenever the shared texture is.
 bool Host::InitFsrTemporal()
 {
-    if (!fsrPipesOk_ || !upSrvHeap_)
+    if (!fsrPipesOk_ || !srvHeap_)
         return false;
     WaitGpu();
     ReleaseFsrTemporal();
 
-    if (upMethod_ < 5 && !ffxModule_)
+    if (!ffxModule_)
     {
-        // AMD's FidelityFX runtime (SDK 2.x holds FSR 3.1 and FSR 4): next to the program, or in an "fsr" / "FSR 4" folder there
         const std::wstring root = oc::ExeDir();
-        const wchar_t* dirs[] = { L"", L"fsr\\", L"FSR\\", L"FSR 4\\", L"FSR4\\", L"FSR_4\\", L"FSR-4\\" };
         const wchar_t* files[] = { L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll" };
-        for (const wchar_t* d : dirs)
+        for (const wchar_t* file : files)
         {
-            for (const wchar_t* f : files)
+            const std::wstring path = root + file;
+            if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
+                continue;
+            HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!module)
             {
-                const std::wstring path = root + d + f;
-                if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
-                    continue;
-                HMODULE m = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-                if (!m)
-                {
-                    Log("FSR3/4: %ls could not be loaded (error %lu)", path.c_str(), GetLastError());
-                    continue;
-                }
-                ffxFunctions fn{};
-                ffxLoadFunctions(&fn, m);
-                if (!fn.CreateContext || !fn.DestroyContext || !fn.Dispatch)
-                {
-                    Log("FSR3/4: %ls has no FidelityFX API", path.c_str());
-                    FreeLibrary(m);
-                    continue;
-                }
-                ffxModule_ = m;
-                ffxFn_ = fn;
-                Log("FSR3/4: runtime %ls", path.c_str());
-                break;
+                Log("FFX runtime %ls could not be loaded (error %lu)", path.c_str(), GetLastError());
+                continue;
             }
-            if (ffxModule_)
-                break;
+            ffxFunctions functions{};
+            ffxLoadFunctions(&functions, module);
+            if (!functions.CreateContext || !functions.DestroyContext || !functions.Dispatch)
+            {
+                Log("FFX runtime %ls does not expose the required API", path.c_str());
+                FreeLibrary(module);
+                continue;
+            }
+            ffxModule_ = module;
+            ffxFn_ = functions;
+            Log("FFX runtime %ls", path.c_str());
+            break;
         }
         if (!ffxModule_)
         {
-            Log("FSR3/4: amd_fidelityfx_dx12.dll was not found next to the program (or in an \"fsr\" / \"FSR 4\" folder)");
+            if (!ffxUnavailableLogged_)
+            {
+                Log("FFX runtime is unavailable; place a compatible amd_fidelityfx_dx12.dll next to the executables to exercise the temporal scaffold");
+                ffxUnavailableLogged_ = true;
+            }
             return false;
         }
     }
-
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     auto make = [&](ComPtr<ID3D12Resource>& r, UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st) {
@@ -1615,15 +1097,15 @@ bool Host::InitFsrTemporal()
         !make(fsrOut_, outW_, outH_, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
     {
-        Log("FSR3/4: textures could not be made");
+        Log("FFX flow: textures could not be made");
         ReleaseFsrTemporal();
         return false;
     }
 
-    // descriptors (see InitUpscale's layout)
+    // FFX descriptor layout.
     auto cpu = [&](UINT n) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = upSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += static_cast<SIZE_T>(upSrvInc_) * n;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(srvInc_) * n;
         return h;
     };
     auto srv = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT n) {
@@ -1652,26 +1134,11 @@ bool Host::InitFsrTemporal()
     srv(fsrTex_[0].Get(), kFormat, 15);
     srv(fsrBlk_.Get(), DXGI_FORMAT_R16G16_FLOAT, 16);
 
-    if (upMethod_ == 5)
-    {
-        if (!InitDlss())
-        {
-            ReleaseFsrTemporal();
-            return false;
-        }
-        fsrReady_ = true;
-        fsrHavePrev_ = false;
-        fsrCur_ = 1;
-        fsrLast_ = std::chrono::steady_clock::now();
-        Log("DLSS: %ux%u -> %ux%u", width_, height_, outW_, outH_);
-        return true;
-    }
-
-    // AMD's upscaling context: gamma-encoded colour (the frame as the game shows it), no jitter, flat depth
+    // FFX temporal context: gamma-encoded colour, estimated motion vectors, synthetic depth, and no jitter
     ffxCreateBackendDX12Desc backendDesc{};
     backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
     backendDesc.device = dev12_.Get();
-    // SDK 2.x runtimes (FSR 4) ask for the API version the program was built against: type 0x0001000b, version 4.1.1
+    // FidelityFX API 4.1.1 runtimes use this version descriptor: type 0x0001000b.
     struct VersionDesc { ffxCreateContextDescHeader header; uint32_t version; } versionDesc{};
     versionDesc.header.type = 0x0001000bu;
     versionDesc.version = (4u << 22) | (1u << 12) | 1u;
@@ -1687,7 +1154,7 @@ bool Host::InitFsrTemporal()
     if (rc != FFX_API_RETURN_OK || !ffxCtx_)
     {
         ffxCtx_ = nullptr;
-        Log("FSR3/4: AMD's runtime could not make its upscaling context (code %u)", static_cast<unsigned>(rc));
+        Log("FFX flow: AMD's runtime could not make its upscaling context (code %u)", static_cast<unsigned>(rc));
         ReleaseFsrTemporal();
         return false;
     }
@@ -1696,212 +1163,18 @@ bool Host::InitFsrTemporal()
         ffxQueryGetProviderVersion used{};
         used.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
         if (ffxFn_.Query(&ffxCtx_, &used.header) == FFX_API_RETURN_OK && used.versionName)
-            Log("FSR3/4: the runtime runs %s", used.versionName);
+            Log("FFX flow: the runtime runs %s", used.versionName);
     }
     fsrReady_ = true;
     fsrHavePrev_ = false;
     fsrCur_ = 1;
     fsrLast_ = std::chrono::steady_clock::now();
-    Log("FSR3/4: %ux%u -> %ux%u", width_, height_, outW_, outH_);
+    Log("FFX flow: %ux%u -> %ux%u", width_, height_, outW_, outH_);
     return true;
 }
 
-#ifdef OC_HAVE_NGX
-static void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature)
-{
-    if (!message)
-        return;
-    std::string line(message);
-    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-        line.pop_back();
-    if (line.find("error") == std::string::npos && line.find("warning") == std::string::npos)
-        return;
-    Log("[ngx] %s", line.c_str());
-}
-
-bool Host::InitDlss()
-{
-    // NVIDIA's runtime (nvngx_dlss.dll): next to the program, or in a "dlss" folder there
-    const std::wstring root = oc::ExeDir();
-    std::vector<std::wstring> dirs;
-    std::wstring found;
-    for (const wchar_t* d : { L"", L"dlss\\", L"DLSS\\", L"DLSS 4\\", L"fsr\\" })
-    {
-        const std::wstring dir = root + d;
-        if (GetFileAttributesW((dir + L"nvngx_dlss.dll").c_str()) != INVALID_FILE_ATTRIBUTES)
-        {
-            if (found.empty())
-                found = dir;
-            dirs.push_back(!dir.empty() && dir.back() == L'\\' ? dir.substr(0, dir.size() - 1) : dir);
-        }
-    }
-    if (found.empty())
-    {
-        Log("DLSS: nvngx_dlss.dll was not found next to the program (or in a \"dlss\" folder)");
-        return false;
-    }
-    Log("DLSS: runtime %lsnvngx_dlss.dll", found.c_str());
-    if (!ngxInit_)
-    {
-        wchar_t tmp[MAX_PATH] = {};
-        GetTempPathW(MAX_PATH, tmp);
-        std::vector<const wchar_t*> paths;
-        for (const std::wstring& d : dirs)
-            paths.push_back(d.c_str());
-        NVSDK_NGX_FeatureCommonInfo info{};
-        info.PathListInfo.Path = paths.data();
-        info.PathListInfo.Length = static_cast<unsigned>(paths.size());
-        info.LoggingInfo.LoggingCallback = NgxLog;
-        info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
-        info.LoggingInfo.DisableOtherLoggingSinks = false;
-        const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x4F43484Full, tmp, dev12_.Get(), &info);
-        if (NVSDK_NGX_FAILED(r))
-        {
-            Log("DLSS: NGX did not start (0x%08x)", static_cast<unsigned>(r));
-            return false;
-        }
-        ngxInit_ = true;
-    }
-    NVSDK_NGX_Parameter* caps = nullptr;
-    int available = 0, needsDriver = 0, initResult = 0;
-    unsigned minMajor = 0, minMinor = 0;
-    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D12_GetCapabilityParameters(&caps)) && caps)
-    {
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available);
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needsDriver);
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &minMajor);
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minMinor);
-        caps->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &initResult);
-        NVSDK_NGX_D3D12_DestroyParameters(caps);
-    }
-    if (!available)
-    {
-        if (needsDriver)
-            Log("DLSS: needs a newer NVIDIA driver (%u.%u or later)", minMajor, minMinor);
-        else
-            Log("DLSS: Super Resolution is not available on this card/driver (init result 0x%08x). It needs an NVIDIA RTX card.",
-                static_cast<unsigned>(initResult));
-        return false;
-    }
-    NVSDK_NGX_Parameter* p = nullptr;
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_AllocateParameters(&p)) || !p)
-    {
-        Log("DLSS: NGX gave no parameters");
-        return false;
-    }
-    ngxParams_ = p;
-
-    const float ratio = static_cast<float>(outW_) / static_cast<float>(width_ ? width_ : 1);
-    const NVSDK_NGX_PerfQuality_Value quality = ratio <= 1.01f ? NVSDK_NGX_PerfQuality_Value_DLAA
-                                                : ratio <= 1.55f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
-                                                : ratio <= 1.75f ? NVSDK_NGX_PerfQuality_Value_Balanced
-                                                : ratio <= 2.2f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
-                                                                : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
-    // model: L when upscaling, E at 1:1; the ini key [Upscale] DlssPreset picks another one (11 = K, lighter on RTX 20/30)
-    unsigned preset = static_cast<unsigned>(st_.dlssPreset);
-    if (preset == 0 || preset == 16)
-        preset = ratio <= 1.01f ? 5u : 12u;
-    p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-    p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-    p->Set(NVSDK_NGX_Parameter_Width, width_);
-    p->Set(NVSDK_NGX_Parameter_Height, height_);
-    p->Set(NVSDK_NGX_Parameter_OutWidth, outW_);
-    p->Set(NVSDK_NGX_Parameter_OutHeight, outH_);
-    p->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(quality));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, static_cast<int>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
-    for (const char* key : { NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
-                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
-                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality })
-        p->Set(key, preset);
-
-    // the feature is created on a command list of its own
-    ComPtr<ID3D12CommandAllocator> alloc;
-    ComPtr<ID3D12GraphicsCommandList> cl;
-    if (FAILED(dev12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
-        FAILED(dev12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&cl))))
-    {
-        Log("DLSS: command list could not be made");
-        return false;
-    }
-    NVSDK_NGX_Handle* handle = nullptr;
-    const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_CreateFeature(cl.Get(), NVSDK_NGX_Feature_SuperSampling, p, &handle);
-    cl->Close();
-    ID3D12CommandList* lists[] = { cl.Get() };
-    queue_->ExecuteCommandLists(1, lists);
-    WaitGpu();
-    if (NVSDK_NGX_FAILED(r) || !handle)
-    {
-        Log("DLSS: could not create the feature (0x%08x)", static_cast<unsigned>(r));
-        return false;
-    }
-    ngxFeature_ = handle;
-    Log("DLSS: model preset %u, x%.2f", preset, ratio);
-    return true;
-}
-
-void Host::ReleaseDlssFeature()
-{
-    if (ngxFeature_)
-        NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(ngxFeature_));
-    ngxFeature_ = nullptr;
-    if (ngxParams_)
-        NVSDK_NGX_D3D12_DestroyParameters(static_cast<NVSDK_NGX_Parameter*>(ngxParams_));
-    ngxParams_ = nullptr;
-}
-
-void Host::ShutdownDlss()
-{
-    ReleaseDlssFeature();
-    if (ngxInit_ && dev12_)
-        NVSDK_NGX_D3D12_Shutdown1(dev12_.Get());
-    ngxInit_ = false;
-}
-
-bool Host::RecordDlss(ID3D12Resource* curTex, bool reset)
-{
-    if (!ngxFeature_ || !ngxParams_)
-        return false;
-    auto* p = static_cast<NVSDK_NGX_Parameter*>(ngxParams_);
-    p->Set(NVSDK_NGX_Parameter_Color, curTex);
-    p->Set(NVSDK_NGX_Parameter_Output, fsrOut_.Get());
-    p->Set(NVSDK_NGX_Parameter_Depth, fsrDepth_.Get());
-    p->Set(NVSDK_NGX_Parameter_MotionVectors, fsrMv_.Get());
-    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, fsrReact_.Get()); // where the motion cannot be trusted
-    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, 0u);
-    p->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, 0u);
-    p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
-    p->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
-    p->Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.0f);
-    p->Set(NVSDK_NGX_Parameter_MV_Scale_Y, -1.0f); // the same sign FSR3/4 gets
-    p->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
-    p->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f); // the slider is applied afterwards by our RCAS pass
-    p->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, 1.0f);
-    p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, width_);
-    p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, height_);
-    const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_EvaluateFeature_C(list_.Get(), static_cast<NVSDK_NGX_Handle*>(ngxFeature_), p, nullptr);
-    if (NVSDK_NGX_FAILED(r))
-    {
-        static int logged = 0;
-        if (logged++ < 5)
-            Log("DLSS: evaluate failed (0x%08x)", static_cast<unsigned>(r));
-        return false;
-    }
-    return true;
-}
-#else
-bool Host::InitDlss()
-{
-    Log("DLSS: this build has no NVIDIA NGX SDK (the \"Fetch NVIDIA DLSS SDK\" step of the build did not run or failed)");
-    return false;
-}
-void Host::ReleaseDlssFeature() {}
-void Host::ShutdownDlss() {}
-bool Host::RecordDlss(ID3D12Resource*, bool) { return false; }
-#endif
-
-// Per frame, before the final pass: the captured frame is copied, its motion measured against the frame before, and AMD's upscaler runs.
-void Host::RecordFsrTemporal()
+// Per frame, copy the capture, estimate motion and depth, then dispatch the retained FFX temporal context.
+bool Host::RecordFsrTemporal()
 {
     auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
         D3D12_RESOURCE_BARRIER b{};
@@ -1920,13 +1193,13 @@ void Host::RecordFsrTemporal()
     list_->CopyResource(curTex, shared12_.Get());
     barrier(curTex, D3D12_RESOURCE_STATE_COPY_DEST, nps);
 
-    ID3D12DescriptorHeap* heaps[] = { upSrvHeap_.Get() };
+    ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
     list_->SetDescriptorHeaps(1, heaps);
     list_->SetComputeRootSignature(fsrRoot_.Get());
-    const D3D12_GPU_DESCRIPTOR_HANDLE base = upSrvHeap_->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE base = srvHeap_->GetGPUDescriptorHandleForHeapStart();
     auto slot = [&](UINT n) {
         D3D12_GPU_DESCRIPTOR_HANDLE h = base;
-        h.ptr += static_cast<UINT64>(upSrvInc_) * n;
+        h.ptr += static_cast<UINT64>(srvInc_) * n;
         return h;
     };
     const UINT bw = (width_ + 3) / 4, bh = (height_ + 3) / 4;
@@ -1952,20 +1225,13 @@ void Host::RecordFsrTemporal()
     const auto now = std::chrono::steady_clock::now();
     float frameMs = static_cast<float>(std::chrono::duration<double, std::milli>(now - fsrLast_).count());
     fsrLast_ = now;
-    // Blend with DWM capture timestamp delta to smooth out CPU scheduling jitter for Frame Generation:
+    // Use the WGC source-frame interval to reduce CPU scheduling jitter in the temporal input timing.
     if (!srcGaps_.empty() && srcGaps_.back() >= 2.0 && srcGaps_.back() <= 100.0)
         frameMs = static_cast<float>(0.7 * srcGaps_.back() + 0.3 * frameMs);
     if (frameMs < 1.0f || frameMs > 250.0f)
         frameMs = 16.666f;
 
     barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (upMethod_ == 5)
-    {
-        RecordDlss(curTex, !fsrHavePrev_);
-        barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        fsrHavePrev_ = true;
-        return;
-    }
     ffxDispatchDescUpscale d{};
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = list_.Get();
@@ -1975,10 +1241,10 @@ void Host::RecordFsrTemporal()
     d.reactive = ffxApiGetResourceDX12(fsrReact_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ); // where the motion cannot be trusted
     d.output = ffxApiGetResourceDX12(fsrOut_.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
     d.jitterOffset = { 0.0f, 0.0f };
-    d.motionVectorScale = { 1.0f, -1.0f }; // sub-pixel vectors with inverted Y for DX12 / OptiScaler FG
+    d.motionVectorScale = { 1.0f, -1.0f }; // sub-pixel vectors with inverted Y for D3D12
     d.renderSize = { width_, height_ };
     d.upscaleSize = { outW_, outH_ };
-    d.enableSharpening = false; // the sharpness slider is applied afterwards by our RCAS pass (RecordUpscale)
+    d.enableSharpening = false;
     d.sharpness = 0.0f;
     d.frameTimeDelta = frameMs;
     d.preExposure = 1.0f;
@@ -1991,199 +1257,82 @@ void Host::RecordFsrTemporal()
     const ffxReturnCode_t rc = ffxFn_.Dispatch(&ffxCtx_, &d.header);
     if (rc != FFX_API_RETURN_OK)
     {
-        static int logged = 0;
-        if (logged++ < 5)
-            Log("FSR3/4: dispatch failed (code %u)", static_cast<unsigned>(rc));
+        Log("FFX flow: dispatch failed (code %u); falling back to the captured frame", static_cast<unsigned>(rc));
+        barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        fsrReady_ = false;
+        fsrHavePrev_ = false;
+        return false;
     }
     barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     fsrHavePrev_ = true;
+    return true;
 }
 
 // The shared texture is recreated whenever the game's picture size changes: point SRV 0 at the new one.
-bool Host::CreateUpscaleViews()
+bool Host::CreateFsrViews()
 {
-    if (!upSrvHeap_ || !shared12_)
+    if (!srvHeap_ || !shared12_)
         return false;
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = kFormat;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    dev12_->CreateShaderResourceView(shared12_.Get(), &sv, upSrvHeap_->GetCPUDescriptorHandleForHeapStart());
-    if (upMethod_ >= 4 && !InitFsrTemporal())
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = kFormat;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2D.MipLevels = 1;
+    dev12_->CreateShaderResourceView(shared12_.Get(), &view, srvHeap_->GetCPUDescriptorHandleForHeapStart());
+    if (fsrPipesOk_ && !InitFsrTemporal() && !ffxUnavailableLogged_)
     {
-        Log("Output scaling: %s is not available, using FSR 1 instead", upMethod_ == 5 ? "DLSS" : "FSR3/4");
-        upMethod_ = 2;
+        Log("FFX temporal runtime is unavailable; displaying the captured frame directly");
+        ffxUnavailableLogged_ = true;
     }
     return true;
 }
 
-static UINT FloatBits(float f)
+void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index, bool temporalOutput)
 {
-    UINT u;
-    memcpy(&u, &f, sizeof(u));
-    return u;
-}
-
-// Records the scaling passes into list_: bilinear (one pass) or FSR 1 (EASU into the intermediate, RCAS into the back buffer).
-void Host::RecordUpscale(ID3D12Resource* bb, UINT idx)
-{
-    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = r;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = from;
-        b.Transition.StateAfter = to;
-        list_->ResourceBarrier(1, &b);
+    auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        list_->ResourceBarrier(1, &barrier);
     };
 
-    const bool fsrTemporal = upMethod_ >= 4 && fsrReady_;
-    if (fsrTemporal)
-        RecordFsrTemporal(); // changes the list's heap and root signature: the graphics ones are set again below
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(index) * rtvInc_;
+    dev12_->CreateRenderTargetView(backBuffer, nullptr, rtv);
+    if (!temporalOutput)
+        transition(shared12_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    ID3D12DescriptorHeap* heaps[] = { upSrvHeap_.Get() };
+    ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
     list_->SetDescriptorHeaps(1, heaps);
-    list_->SetGraphicsRootSignature(upRoot_.Get());
+    list_->SetGraphicsRootSignature(blitRoot_.Get());
+    list_->SetPipelineState(blitPso_.Get());
     list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    D3D12_VIEWPORT vp{ 0.0f, 0.0f, static_cast<float>(outW_), static_cast<float>(outH_), 0.0f, 1.0f };
-    D3D12_RECT sc{ 0, 0, static_cast<LONG>(outW_), static_cast<LONG>(outH_) };
-    list_->RSSetViewports(1, &vp);
-    list_->RSSetScissorRects(1, &sc);
+    D3D12_VIEWPORT viewport{ 0.0f, 0.0f, static_cast<float>(outW_), static_cast<float>(outH_), 0.0f, 1.0f };
+    D3D12_RECT scissor{ 0, 0, static_cast<LONG>(outW_), static_cast<LONG>(outH_) };
+    list_->RSSetViewports(1, &viewport);
+    list_->RSSetScissorRects(1, &scissor);
+    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    if (temporalOutput)
+        srv.ptr += static_cast<UINT64>(srvInc_) * 6;
+    list_->SetGraphicsRootDescriptorTable(0, srv);
+    list_->DrawInstanced(3, 1, 0, 0);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE midRtv = upRtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE bbRtv = midRtv;
-    bbRtv.ptr += static_cast<SIZE_T>(1 + (idx & 31)) * upRtvInc_;
-    dev12_->CreateRenderTargetView(bb, nullptr, bbRtv);
-
-    D3D12_GPU_DESCRIPTOR_HANDLE srv0 = upSrvHeap_->GetGPUDescriptorHandleForHeapStart();
-    auto slot = [&](UINT n) {
-        D3D12_GPU_DESCRIPTOR_HANDLE h = srv0;
-        h.ptr += static_cast<UINT64>(upSrvInc_) * n;
-        return h;
-    };
-    const D3D12_GPU_DESCRIPTOR_HANDLE srv1 = slot(3); // EASU result
-
-    const float inW = static_cast<float>(width_);
-    const float inH = static_cast<float>(height_);
-    const float ouW = static_cast<float>(outW_);
-    const float ouH = static_cast<float>(outH_);
-    UINT c[16] = {};
-
-    D3D12_GPU_DESCRIPTOR_HANDLE finalSrc = fsrTemporal ? slot(6) : srv0;
-    if (upMethod_ == 3 && nisPso_)
-    {
-        if (!nisCoefDone_)
-        {
-            // first frame: copy the filter tables into their textures
-            D3D12_RESOURCE_DESC cr = nisCoef_[0]->GetDesc();
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-            UINT rows = 0;
-            UINT64 rowBytes = 0, total = 0;
-            dev12_->GetCopyableFootprints(&cr, 0, 1, 0, &fp, &rows, &rowBytes, &total);
-            for (int i = 0; i < 2; ++i)
-            {
-                D3D12_TEXTURE_COPY_LOCATION dst{};
-                dst.pResource = nisCoef_[i].Get();
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                dst.SubresourceIndex = 0;
-                D3D12_TEXTURE_COPY_LOCATION srcLoc{};
-                srcLoc.pResource = nisUpload_.Get();
-                srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                srcLoc.PlacedFootprint = fp;
-                srcLoc.PlacedFootprint.Offset = static_cast<UINT64>(i) * total;
-                list_->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
-                barrier(nisCoef_[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            }
-            nisCoefDone_ = true;
-        }
-        NISConfig cfg{};
-        NVScalerUpdateConfig(cfg, static_cast<float>(st_.nisSharp) / 100.0f, 0, 0, width_, height_, width_, height_, 0, 0, outW_, outH_,
-                             outW_, outH_);
-        barrier(nisOut_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        list_->SetComputeRootSignature(nisRoot_.Get());
-        list_->SetPipelineState(nisPso_.Get());
-        list_->SetComputeRoot32BitConstants(0, 28, &cfg, 0);
-        list_->SetComputeRootDescriptorTable(1, srv0);
-        list_->SetComputeRootDescriptorTable(2, slot(4));
-        list_->Dispatch((outW_ + 31) / 32, (outH_ + 23) / 24, 1);
-        barrier(nisOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        finalSrc = slot(5);
-        list_->SetGraphicsRootSignature(upRoot_.Get());
-    }
-
-    barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-    if (upMethod_ == 2)
-    {
-        // EASU: edge adaptive upscale, captured picture -> intermediate (output size)
-        c[0] = FloatBits(inW / ouW);
-        c[1] = FloatBits(inH / ouH);
-        c[2] = FloatBits(0.5f * inW / ouW - 0.5f);
-        c[3] = FloatBits(0.5f * inH / ouH - 0.5f);
-        c[4] = FloatBits(1.0f / inW);
-        c[5] = FloatBits(1.0f / inH);
-        c[6] = FloatBits(1.0f / inW);
-        c[7] = FloatBits(-1.0f / inH);
-        c[8] = FloatBits(-1.0f / inW);
-        c[9] = FloatBits(2.0f / inH);
-        c[10] = FloatBits(1.0f / inW);
-        c[11] = FloatBits(2.0f / inH);
-        c[12] = 0;
-        c[13] = FloatBits(4.0f / inH);
-        barrier(upMid_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        list_->OMSetRenderTargets(1, &midRtv, FALSE, nullptr);
-        list_->SetPipelineState(upPsoEasu_.Get());
-        list_->SetGraphicsRoot32BitConstants(0, 16, c, 0);
-        list_->SetGraphicsRootDescriptorTable(1, srv0);
-        list_->DrawInstanced(3, 1, 0, 0);
-        barrier(upMid_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-        // RCAS: sharpen, intermediate -> back buffer
-        UINT r[16] = {};
-        r[0] = FloatBits(std::exp2(-static_cast<float>(st_.upscaleSharp) / 100.0f));
-        list_->OMSetRenderTargets(1, &bbRtv, FALSE, nullptr);
-        list_->SetPipelineState(upPsoRcas_.Get());
-        list_->SetGraphicsRoot32BitConstants(0, 16, r, 0);
-        list_->SetGraphicsRootDescriptorTable(1, srv1);
-        list_->DrawInstanced(3, 1, 0, 0);
-    }
-    else if (fsrTemporal && st_.nisSharp > 0)
-    {
-        // FSR3/4's own sharpening is faint (and FSR 4 has none): the sharpness slider drives FSR 1's RCAS on FSR's picture instead.
-        // Slider 0 = no extra sharpening, 100 = RCAS at its usual maximum (linear; beyond that the picture turns snowy).
-        UINT r[16] = {};
-        r[0] = FloatBits(static_cast<float>(std::clamp(st_.nisSharp, 0, 100)) / 100.0f);
-        list_->OMSetRenderTargets(1, &bbRtv, FALSE, nullptr);
-        list_->SetPipelineState(upPsoRcas_.Get());
-        list_->SetGraphicsRoot32BitConstants(0, 16, r, 0);
-        list_->SetGraphicsRootDescriptorTable(1, finalSrc);
-        list_->DrawInstanced(3, 1, 0, 0);
-    }
-    else
-    {
-        c[0] = FloatBits(1.0f / ouW);
-        c[1] = FloatBits(1.0f / ouH);
-        list_->OMSetRenderTargets(1, &bbRtv, FALSE, nullptr);
-        list_->SetPipelineState(upPsoBil_.Get());
-        list_->SetGraphicsRoot32BitConstants(0, 16, c, 0);
-        list_->SetGraphicsRootDescriptorTable(1, finalSrc);
-        list_->DrawInstanced(3, 1, 0, 0);
-    }
-
-    barrier(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    if (!temporalOutput)
+        transition(shared12_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 }
 
-void Host::WaitFenceValue(UINT64 v)
+void Host::WaitFenceValue(UINT64 value)
 {
-    if (v == 0)
+    if (value == 0 || frameFence_->GetCompletedValue() >= value)
         return;
-    if (frameFence_->GetCompletedValue() < v)
-    {
-        frameFence_->SetEventOnCompletion(v, fenceEvent_);
-        WaitForSingleObject(fenceEvent_, 2000);
-    }
+    frameFence_->SetEventOnCompletion(value, fenceEvent_);
+    WaitForSingleObject(fenceEvent_, 2000);
 }
 
 void Host::WaitGpu()
@@ -2246,8 +1395,7 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
         ctx11_->Begin(q->dj.Get());
         ctx11_->End(q->a.Get());
     }
-    if (opt_.testMode != 2)
-        ctx11_->CopySubresourceRegion(shared11_.Get(), 0, 0, 0, 0, src, 0, &box);
+    ctx11_->CopySubresourceRegion(shared11_.Get(), 0, 0, 0, 0, src, 0, &box);
     if (q)
     {
         ctx11_->End(q->b.Get());
@@ -2299,9 +1447,10 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
     if (tsHeap_)
         list_->EndQuery(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, idx * 2);
 
-    if (upOn_)
+    const bool temporalOutput = blitReady_ && fsrReady_ && RecordFsrTemporal();
+    if (scaleOn_ || temporalOutput)
     {
-        RecordUpscale(bb.Get(), idx);
+        RecordBlit(bb.Get(), idx, temporalOutput);
     }
     else
     {
@@ -2330,24 +1479,13 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
     queue_->ExecuteCommandLists(1, lists);
     bb.Reset();
 
-    const UINT flags = (!opt_.vsync && (swapFlags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    // Frame generation presents several frames per captured frame. Blocking each of them on a vblank caps the base
-    // frame rate at refresh/N and adds a queue of latency, so with FG on the interval stays 0 (the flip-model overlay is
-    // still composed by DWM at vblank, so it does not tear). A real vsync interval is only used without FG.
-    const bool fgActive = st_.frameGenMode != 2;
-    UINT interval = (opt_.vsync && !fgActive) ? 1 : 0;
-    if (st_.presentMode == 1) interval = 0;
-    else if (st_.presentMode == 2) interval = 1;
-    else if (st_.presentMode == 3 || st_.presentMode == 5 || st_.presentMode == 6) interval = opt_.vsync ? 1 : 0; // classic: the host's own VSync, FG or not
-    else if (st_.presentMode == 4) interval = opt_.vsync ? 1 : 0; // Lossless-style: VSync only when asked for, otherwise tearing
     const auto tp0 = std::chrono::steady_clock::now();
-    HRESULT hr = swap_->Present(interval, flags);
+    HRESULT hr = swap_->Present(0, 0);
     {
         const double p = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
         presentMs_ += p;
         livePresent_ += p;
     }
-    lastInterval_ = static_cast<int>(interval);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
     {
         Log("Device lost on Present: 0x%08X (removed reason 0x%08X)", static_cast<unsigned>(hr),
@@ -2361,8 +1499,7 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
     return true;
 }
 
-// The captured frame is the whole window, with any title bar and border. What we show (and what frame generation
-// sees) is only its client area, so work out where that sits inside the frame.
+// The captured frame includes non-client areas; the overlay displays the target's client area.
 bool Host::ComputeCrop(UINT capW, UINT capH, int& cx, int& cy, UINT& w, UINT& h)
 {
     cx = 0;
@@ -2451,12 +1588,7 @@ bool Host::ApplyGeometry(UINT capW, UINT capH)
     {
         width_ = w;
         height_ = h;
-
-        if (!CreateShared())
-            return false;
-
-        // With output scaling the swap chain stays monitor sized, only the shared texture (the scaler's input) changes.
-        if (!upOn_)
+        if (!scaleOn_)
         {
             outW_ = width_;
             outH_ = height_;
@@ -2467,6 +1599,10 @@ bool Host::ApplyGeometry(UINT capW, UINT capH)
                 return false;
             }
         }
+
+        // In scaled modes the swap chain stays monitor sized; only the shared input texture changes.
+        if (!CreateShared())
+            return false;
     }
 
     if (capChanged)
@@ -2545,13 +1681,9 @@ void Host::MoveOverlay()
     }
 }
 
-// OptiScaler's "Force Borderless" (and its restyle on swap chain changes) rewrites the extended style of the window it
-// presents to, which is our overlay: layered, click-through and no-activate all vanish, and the overlay then keeps the
-// mouse and the focus. Put back what we need, a few times a second.
+// OptiScaler may restyle the window it presents to, which is this overlay. Reapply the host's layered and input styles.
 void Host::EnforceOverlayStyle()
 {
-    if (opt_.noLayered)
-        return;
     constexpr LONG_PTR mask = WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_APPWINDOW;
     LONG_PTR want = WS_EX_TOOLWINDOW | WS_EX_LAYERED;
     if (!interactive_)
@@ -2563,7 +1695,7 @@ void Host::EnforceOverlayStyle()
 
     Log("Overlay style was changed from outside (0x%08lX), restoring it", static_cast<unsigned long>(have));
     SetWindowLongPtrW(overlay_, GWL_EXSTYLE, (have & ~mask) | want);
-    SetLayeredWindowAttributes(overlay_, 0, static_cast<BYTE>(opt_.overlayAlpha), LWA_ALPHA);
+    SetLayeredWindowAttributes(overlay_, 0, 255, LWA_ALPHA);
     SetWindowPos(overlay_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     lastBounds_ = {};
 }
@@ -2580,9 +1712,7 @@ void Host::ToggleInteractive()
     SetWindowLongPtrW(overlay_, GWL_EXSTYLE, ex);
     SetWindowPos(overlay_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-    // Interactive: the overlay takes keyboard focus, so OptiScaler (which only accepts its keys, Insert for the menu,
-    // while the window it presents to is the foreground window) actually gets them. Back to click-through: focus
-    // returns to the game.
+    // Interactive mode gives the overlay focus for menu input; click-through mode returns focus to the target window.
     if (interactive_)
     {
         const bool ok = ForceForeground(overlay_);
@@ -2674,8 +1804,6 @@ void Host::PublishLive(std::chrono::steady_clock::time_point now)
     oc::LiveStats ls;
     ls.stamp = GetTickCount64();
     ls.pid = GetCurrentProcessId();
-    ls.refreshHz = refreshHz_;
-
     const unsigned arr = arrivals_.load(std::memory_order_relaxed);
     ls.captureFps = static_cast<double>(arr - liveArrivals_) / dt;
     liveArrivals_ = arr;
@@ -2687,45 +1815,8 @@ void Host::PublishLive(std::chrono::steady_clock::time_point now)
     livePresent_ = 0.0;
     liveWait_ = 0.0;
 
-    DXGI_FRAME_STATISTICS fs{};
-    if (swap_ && SUCCEEDED(swap_->GetFrameStatistics(&fs)))
-    {
-        if (liveDxgiValid_)
-            ls.dxgiFps = static_cast<double>(fs.PresentCount - liveDxgiPresents_) / dt;
-        liveDxgiPresents_ = fs.PresentCount;
-        liveDxgiValid_ = true;
-    }
-
-    ls.interval = lastInterval_;
     const HWND fg = GetForegroundWindow();
     ls.focus = fg == target_ ? 0 : (fg == overlay_ ? 1 : 2);
-
-    // Does the game look capped? Windows Graphics Capture reports an uncapped game at (at most) the refresh rate, so
-    // "at the refresh rate" proves nothing. A capture rate that stays almost exactly the same for several seconds and
-    // sits clearly below the refresh rate is what a VSync lock or a frame limiter looks like (a slow game wobbles).
-    // Classic mode leaves the capture at Windows' own 60 fps ceiling, so nothing can be said there.
-    capHist_.push_back(ls.captureFps);
-    if (capHist_.size() > 6)
-        capHist_.erase(capHist_.begin());
-    if (st_.presentMode != 3 && refreshHz_ > 0.0 && capHist_.size() == 6)
-    {
-        double mn = capHist_[0];
-        double mx = capHist_[0];
-        double sum = 0.0;
-        for (double v : capHist_)
-        {
-            mn = (std::min)(mn, v);
-            mx = (std::max)(mx, v);
-            sum += v;
-        }
-        const double mean = sum / static_cast<double>(capHist_.size());
-        if (mean >= 20.0 && mean < 0.97 * refreshHz_ && (mx - mn) <= 0.02 * mean + 0.6)
-        {
-            ls.capHint = 1;
-            ls.capFps = mean;
-        }
-    }
-
     oc::WriteLiveStats(ls);
 }
 
@@ -2745,22 +1836,18 @@ void Host::Shutdown()
     }
 
     WaitGpu();
-    if (ffxCtx_ && ffxFn_.DestroyContext)
-        ffxFn_.DestroyContext(&ffxCtx_, nullptr);
-    ffxCtx_ = nullptr;
-    ShutdownDlss();
+    ReleaseFsrTemporal();
+    if (ffxModule_)
+    {
+        FreeLibrary(ffxModule_);
+        ffxModule_ = nullptr;
+    }
+
     UnregisterHotkeys();
     if (parentProc_)
         CloseHandle(parentProc_);
-    if (waitable_)
-    {
-        CloseHandle(waitable_);
-        waitable_ = nullptr;
-    }
     swap_.Reset();
     g_spoofOverlay = nullptr;
-    if (label_)
-        DestroyWindow(label_);
     if (overlay_)
         DestroyWindow(overlay_);
     if (fenceEvent_)
@@ -2889,24 +1976,8 @@ void Host::PollSettings()
 
     const oc::Settings old = st_;
     oc::LoadSettings(st_);
-
-    if (st_.vsync != old.vsync)
-    {
-        opt_.vsync = st_.vsync;
-        Log("VSync %s", st_.vsync ? "on" : "off");
-    }
-    if (st_.presentDelay != old.presentDelay)
-    {
-        opt_.presentDelayMs = static_cast<double>(st_.presentDelay);
-        Log("PresentDelayMs = %d (live)", st_.presentDelay);
-    }
-    if (st_.presentMode != old.presentMode)
-        Log("Present mode %d (0 auto, 1 interval 0, 2 interval 1, 3 classic, 4 Lossless-style, 5 classic half refresh, 6 classic unlimited) - restart the capture to apply", st_.presentMode);
-    if (st_.menuKey != old.menuKey)
-    {
-        opt_.menuKey = static_cast<int>(st_.menuKey);
-        Log("OptiScaler menu key is now vk 0x%02X", st_.menuKey);
-    }
+    if (st_.targetScale != old.targetScale)
+        Log("Resolution selection changed; restart capture to apply");
     if (st_.stop != old.stop || st_.focus != old.focus || st_.menu != old.menu)
     {
         RegisterHotkeys();
@@ -2918,42 +1989,13 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
 {
     opt_ = opt;
     st_ = settings;
-    BoostProcess(st_.boost);
-
-    // [Advanced] Buffers=2..4 in OptiCaptureHost.ini: swap chain buffer count (for experiments).
-    opt_.buffers = std::clamp<int>(static_cast<int>(GetPrivateProfileIntW(L"Advanced", L"Buffers", st_.presentMode == 4 ? 2 : opt_.buffers, oc::SettingsPath().c_str())), 2, 4);
-    Log("Swap chain buffers: %d", opt_.buffers);
-    opt_.overlayAlpha = std::clamp<int>(static_cast<int>(GetPrivateProfileIntW(L"Advanced", L"OverlayAlpha", 254, oc::SettingsPath().c_str())), 1, 255);
-    opt_.affinity = std::clamp<int>(static_cast<int>(GetPrivateProfileIntW(L"Advanced", L"Affinity", 0, oc::SettingsPath().c_str())), 0, 2);
-    {
-        wchar_t kb[32] = {};
-        GetPrivateProfileStringW(L"Advanced", L"PaceK", L"1", kb, 32, oc::SettingsPath().c_str());
-        opt_.paceK = std::clamp(_wtof(kb), 0.0, 8.0);
-    }
-    if (st_.presentMode == 3 || st_.presentMode == 4 || st_.presentMode == 5 || st_.presentMode == 6)
-        opt_.overlayAlpha = 255; // classic / Lossless-style: plain opaque overlay (lets Windows flip it straight to the screen)
-    Log("Overlay alpha %d, display affinity %d, PaceK %.2f", opt_.overlayAlpha, opt_.affinity, opt_.paceK);
-    opt_.startDelayMs = std::clamp<int>(static_cast<int>(GetPrivateProfileIntW(L"Advanced", L"StartDelayMs", 1500, oc::SettingsPath().c_str())), 0, 10000);
-    opt_.presentDelayMs = static_cast<double>(std::clamp(st_.presentDelay, 0, 12));
-    if (opt_.presentDelayMs > 0.0)
-        Log("PresentDelayMs = %.0f", opt_.presentDelayMs);
-    opt_.probe = GetPrivateProfileIntW(L"Advanced", L"Probe", 0, oc::SettingsPath().c_str()) != 0;
-    if (opt_.probe)
-        Log("Probe on (picture change check)");
-    opt_.noLayered = GetPrivateProfileIntW(L"Advanced", L"NoLayered", 0, oc::SettingsPath().c_str()) != 0;
-    if (opt_.noLayered)
-        Log("NoLayered test: the overlay is a plain window (mouse clicks will not pass through)");
-    opt_.testMode = std::clamp<int>(static_cast<int>(GetPrivateProfileIntW(L"Advanced", L"TestMode", 0, oc::SettingsPath().c_str())), 0, 2);
-    if (opt_.testMode)
-        Log("TEST MODE %d (diagnostics only: %s)", opt_.testMode, opt_.testMode == 1 ? "frames are captured but nothing is shown" : "the picture is shown but new frames are not copied");
+    Log("Swap chain buffers: 3");
 
     {
         DEVMODEW dm{};
         dm.dmSize = sizeof(dm);
         if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm))
             Log("Primary display: %lux%lu at %lu Hz", dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
-        if (dm.dmDisplayFrequency > 1)
-            refreshHz_ = static_cast<double>(dm.dmDisplayFrequency);
     }
     iniStamp_ = oc::FileStamp(oc::SettingsPath());
     inst_ = GetModuleHandleW(nullptr);
@@ -2986,8 +2028,8 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
 
     RegisterHotkeys();
 
-    // [Advanced] FocusSpoof=0 in OptiCaptureHost.ini turns the focus spoof off.
-    focusSpoof_ = GetPrivateProfileIntW(L"Advanced", L"FocusSpoof", 1, oc::SettingsPath().c_str()) != 0;
+    // Keep this host-local workaround for upscalers that require the capture overlay to appear foreground.
+    focusSpoof_ = true;
     if (focusSpoof_)
     {
         g_realGetForeground = reinterpret_cast<GetForegroundFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetForegroundWindow"));
@@ -3011,28 +2053,11 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
 
     session_.StartCapture();
     liveAt_ = std::chrono::steady_clock::now();
-    Log("Capture started (VSync %s). Shortcuts (defaults): Ctrl+Shift+F12 quits, F11 toggles click-through, F10 opens the OptiScaler menu.",
-        opt_.vsync ? "on" : "off");
-    {
-        // Show what OptiScaler.ini says about vsync / frame generation, since OptiScaler can override our Present interval.
-        std::ifstream f(oc::ExeDir() + L"OptiScaler.ini");
-        std::string line;
-        while (std::getline(f, line))
-        {
-            size_t a = line.find_first_not_of(" \t");
-            if (a == std::string::npos || line[a] == ';') continue;
-            if (_strnicmp(line.c_str() + a, "ForceVsync", 10) == 0 || _strnicmp(line.c_str() + a, "VsyncInterval", 13) == 0 ||
-                _strnicmp(line.c_str() + a, "FGOutput", 8) == 0 || _strnicmp(line.c_str() + a, "FramerateLimit", 14) == 0 ||
-                _strnicmp(line.c_str() + a, "UseGamesReflexMarkers", 21) == 0)
-                Log("OptiScaler.ini: %s", line.c_str() + a);
-        }
-    }
+    Log("Capture started. Host shortcuts control stop, overlay focus, and the OptiScaler menu.");
 
     auto lastHousekeeping = std::chrono::steady_clock::now();
     UINT64 frames = 0;
     int slowLogged = 0;
-    UINT lastPresentCount = 0;
-    UINT lastRefreshCount = 0;
     auto statStart = lastHousekeeping;
     bool running = true;
 
@@ -3095,7 +2120,7 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             const auto hk0 = std::chrono::steady_clock::now();
             if (focusSpoof_ && now - spoofScanAt_ > std::chrono::seconds(1))
             {
-                spoofScanAt_ = now; // OptiScaler loads the frame generation DLLs a little later
+                spoofScanAt_ = now;
                 PatchNewModules(spoofSeen_);
                 spoofMaxMs_ = (std::max)(spoofMaxMs_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hk0).count());
             }
@@ -3108,7 +2133,6 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             if (!RefreshGeometry())
                 break;
             MoveOverlay();
-            UpdateLabel();
             houseMaxMs_ = (std::max)(houseMaxMs_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hk0).count());
         }
         if (now - liveAt_ >= std::chrono::seconds(1))
@@ -3162,10 +2186,6 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
                 if (describe(srcGaps_, a, p, m, s))
                     Log("  frame time stamps from Windows: avg %.1f ms, 99%% %.1f ms, max %.1f ms, %d of %zu slow", a, p, m, s, srcGaps_.size());
                 srcGaps_.clear();
-                if (contentNew_ + contentRep_ > 0)
-                    Log("  picture changed: %d new, %d identical to the one before (longest run %d) of %d", contentNew_, contentRep_,
-                        repMax_, contentNew_ + contentRep_);
-                contentNew_ = contentRep_ = repMax_ = 0;
                 if (gpu11N_ > 0 || gpu12N_ > 0)
                     Log("  host GPU time per frame: D3D11 copy %.2f ms (max %.2f), D3D12 copy %.2f ms (max %.2f)",
                         gpu11N_ ? gpu11Ms_ / gpu11N_ : 0.0, gpu11Max_, gpu12N_ ? gpu12Ms_ / gpu12N_ : 0.0, gpu12Max_);
@@ -3175,21 +2195,6 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
                 presGaps_.clear();
                 houseMaxMs_ = 0.0;
                 spoofMaxMs_ = 0.0;
-            }
-
-            // What DXGI says it really put on screen: presents that reached the display vs display refreshes.
-            DXGI_FRAME_STATISTICS fs{};
-            if (swap_ && SUCCEEDED(swap_->GetFrameStatistics(&fs)))
-            {
-                Log("  DXGI stats: presents %u (+%u), refreshes shown %u (+%u), sync refresh %u", fs.PresentCount,
-                    fs.PresentCount - lastPresentCount, fs.PresentRefreshCount, fs.PresentRefreshCount - lastRefreshCount,
-                    fs.SyncRefreshCount);
-                lastPresentCount = fs.PresentCount;
-                lastRefreshCount = fs.PresentRefreshCount;
-            }
-            else
-            {
-                Log("  DXGI stats unavailable");
             }
 
             // Which windows are above the overlay right now (anything topmost that covers it costs the overlay its fast path).
@@ -3209,98 +2214,6 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             statStart = now;
         }
 
-        // VSync with Arthur frame generation: keep the host's frames k / refresh apart (k = presents per host frame).
-        if (opt_.vsync && st_.frameGenMode == 1 && st_.presentMode != 1 && st_.presentMode != 3 && st_.presentMode != 4 && st_.presentMode != 5 && st_.presentMode != 6 && refreshHz_ > 0.0)
-        {
-            const auto np = std::chrono::steady_clock::now();
-            if (opt_.paceK >= 0.25)
-                pacePerFrame_ = opt_.paceK;
-            else if (np - paceStatAt_ > std::chrono::milliseconds(500))
-            {
-                DXGI_FRAME_STATISTICS pfs{};
-                if (swap_ && SUCCEEDED(swap_->GetFrameStatistics(&pfs)))
-                {
-                    if (paceFrames_ >= 8 && paceStatAt_.time_since_epoch().count() != 0)
-                    {
-                        double k = static_cast<double>(pfs.PresentCount - paceLastPresents_) / static_cast<double>(paceFrames_);
-                        if (std::fabs(k - std::round(k)) < 0.15)
-                            k = std::round(k);
-                        if (k >= 1.0 && k <= 8.0)
-                            pacePerFrame_ = 0.5 * pacePerFrame_ + 0.5 * k;
-                    }
-                    paceLastPresents_ = pfs.PresentCount;
-                }
-                paceFrames_ = 0;
-                paceStatAt_ = np;
-                if (!paceOutput_ && swap_)
-                    swap_->GetContainingOutput(&paceOutput_);
-            }
-            if (!paceOutput_ && swap_)
-                swap_->GetContainingOutput(&paceOutput_);
-            // Wait until just before the next slot, then line the frame up with a vblank so the real and generated
-            // frames of Arthur land on the display refresh grid.
-            const auto target = paceLast_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                std::chrono::duration<double>(pacePerFrame_ / refreshHz_)) -
-                                std::chrono::milliseconds(3);
-            for (;;)
-            {
-                const auto left = target - std::chrono::steady_clock::now();
-                if (left <= std::chrono::steady_clock::duration::zero())
-                    break;
-                if (left > std::chrono::milliseconds(2))
-                    Sleep(1);
-                else
-                    YieldProcessor();
-            }
-            if (paceOutput_ && FAILED(paceOutput_->WaitForVBlank()))
-                paceOutput_.Reset();
-        }
-
-        // Present mode 5 (Classic, half refresh): hand the frame generator exactly refresh / 2 frames per second (60 Hz -> 30,
-        // 75 Hz -> 37.5), no more. Extra frames would only be generated, queued and dropped, and load the GPU. The wait ends on
-        // a real vblank, so every base frame is exactly two refreshes after the previous one.
-        if (st_.presentMode == 5 && refreshHz_ > 0.0)
-        {
-            if (halfSkip_)
-            {
-                halfSkip_ = false;
-            }
-            else
-            {
-                const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(2.0 / refreshHz_));
-                auto nowT = std::chrono::steady_clock::now();
-                if (halfNext_.time_since_epoch().count() == 0 || nowT > halfNext_ + period)
-                    halfNext_ = nowT; // first frame, or we fell behind: start over
-                if (!paceOutput_ && swap_)
-                    swap_->GetContainingOutput(&paceOutput_);
-                const auto margin = paceOutput_ ? std::chrono::milliseconds(3) : std::chrono::milliseconds(0);
-                for (;;)
-                {
-                    const auto left = halfNext_ - margin - std::chrono::steady_clock::now();
-                    if (left <= std::chrono::steady_clock::duration::zero())
-                        break;
-                    if (left > std::chrono::milliseconds(2))
-                        Sleep(1);
-                    else
-                        YieldProcessor();
-                }
-                if (paceOutput_)
-                {
-                    if (SUCCEEDED(paceOutput_->WaitForVBlank()))
-                        halfNext_ = std::chrono::steady_clock::now() + period;
-                    else
-                    {
-                        paceOutput_.Reset();
-                        halfNext_ += period;
-                    }
-                }
-                else
-                {
-                    halfNext_ += period;
-                }
-            }
-        }
-
         // Take the newest captured frame and drop older ones (lower latency than queueing them).
         wgc::Direct3D11CaptureFrame latest{ nullptr };
         for (;;)
@@ -3311,65 +2224,7 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             latest = f;
         }
         if (!latest)
-        {
-            halfSkip_ = true;
             continue;
-        }
-        const auto tGot = std::chrono::steady_clock::now();
-
-        // Lossless-style mode: let the swap chain's frame queue drain first (latency 1), then take the newest captured
-        // frame again, so the picture shown is as fresh as possible. If the wait keeps timing out (the presents are not
-        // coming through this swap chain), the wait switches itself off.
-        if (waitable_)
-        {
-            if (WaitForSingleObjectEx(waitable_, 20, FALSE) == WAIT_TIMEOUT)
-            {
-                if (++waitTimeouts_ >= 5)
-                {
-                    Log("Frame latency wait timed out 5 times in a row: switched off");
-                    CloseHandle(waitable_);
-                    waitable_ = nullptr;
-                }
-            }
-            else
-            {
-                waitTimeouts_ = 0;
-            }
-            for (;;)
-            {
-                auto f = pool_.TryGetNextFrame();
-                if (!f)
-                    break;
-                latest = f;
-            }
-        }
-
-        // Hold the frame until a fixed point inside the refresh cycle, then take the newest one again. The frame arrives
-        // right when Windows starts composing the next screen; presenting at that moment races the composition, so the
-        // frame lands one refresh earlier or later from one frame to the next. A short fixed delay removes the race.
-        if (opt_.presentDelayMs > 0.0)
-        {
-            const auto until = tGot + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                          std::chrono::duration<double, std::milli>(opt_.presentDelayMs));
-            for (;;)
-            {
-                const auto left = until - std::chrono::steady_clock::now();
-                if (left <= std::chrono::steady_clock::duration::zero())
-                    break;
-                if (left > std::chrono::milliseconds(2))
-                    Sleep(1);
-                else
-                    YieldProcessor();
-            }
-            for (;;)
-            {
-                auto f = pool_.TryGetNextFrame();
-                if (!f)
-                    break;
-                latest = f;
-            }
-        }
-
         const auto cs = latest.ContentSize();
         if (cs.Width <= 0 || cs.Height <= 0)
             continue;
@@ -3403,88 +2258,14 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             lastSrc100ns_ = src;
         }
 
-        // Did the picture really change? 32 small patches spread over the screen are copied to a staging texture and
-        // compared with the previous frame (read one frame later, so nothing waits for the GPU).
-        {
-            D3D11_TEXTURE2D_DESC td{};
-            tex->GetDesc(&td);
-            if (opt_.probe && (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_R8G8B8A8_UNORM) && td.Width >= 256 && td.Height >= 128)
-            {
-                if (!probe_[0])
-                {
-                    D3D11_TEXTURE2D_DESC pd{};
-                    pd.Width = 64;
-                    pd.Height = 32;
-                    pd.MipLevels = 1;
-                    pd.ArraySize = 1;
-                    pd.Format = td.Format;
-                    pd.SampleDesc.Count = 1;
-                    pd.Usage = D3D11_USAGE_STAGING;
-                    pd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    for (int i = 0; i < 2; ++i)
-                        dev11_->CreateTexture2D(&pd, nullptr, &probe_[i]);
-                }
-                if (probe_[0] && probe_[1])
-                {
-                    const int prev = probeIdx_ ^ 1;
-                    D3D11_MAPPED_SUBRESOURCE m{};
-                    if (probeValid_[prev] && SUCCEEDED(ctx11_->Map(probe_[prev].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)))
-                    {
-                        unsigned long long h = 1469598103934665603ULL;
-                        for (UINT y = 0; y < 32; ++y)
-                        {
-                            const unsigned char* row = static_cast<const unsigned char*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
-                            for (UINT x = 0; x < 256; ++x)
-                                h = (h ^ row[x]) * 1099511628211ULL;
-                        }
-                        ctx11_->Unmap(probe_[prev].Get(), 0);
-                        probeValid_[prev] = false;
-                        if (haveHash_ && h == lastHash_)
-                        {
-                            ++contentRep_;
-                            repMax_ = (std::max)(repMax_, ++repRun_);
-                        }
-                        else
-                        {
-                            ++contentNew_;
-                            repRun_ = 0;
-                        }
-                        lastHash_ = h;
-                        haveHash_ = true;
-                    }
-                    for (UINT gy = 0; gy < 4; ++gy)
-                        for (UINT gx = 0; gx < 8; ++gx)
-                        {
-                            const UINT x = (td.Width - 8) * gx / 7;
-                            const UINT y = (td.Height - 8) * gy / 3;
-                            D3D11_BOX box{ x, y, 0, x + 8, y + 8, 1 };
-                            ctx11_->CopySubresourceRegion(probe_[probeIdx_].Get(), 0, gx * 8, gy * 8, 0, tex.Get(), 0, &box);
-                        }
-                    probeValid_[probeIdx_] = true;
-                    probeIdx_ ^= 1;
-                }
-            }
-        }
-
         const auto t0 = std::chrono::steady_clock::now();
         if (presLast_.time_since_epoch().count() != 0 && presGaps_.size() < 4096)
             presGaps_.push_back(std::chrono::duration<double, std::milli>(t0 - presLast_).count());
         presLast_ = t0;
-        paceLast_ = t0;
-        if (opt_.testMode == 1)
-        {
-            static bool hidden = false;
-            if (!hidden)
-            {
-                ShowWindow(overlay_, SW_HIDE);
-                hidden = true;
-            }
-        }
-        else if (!PresentFrame(tex.Get()))
+        if (!PresentFrame(tex.Get()))
             break;
         ++frames;
         ++liveFrames_;
-        ++paceFrames_;
         const double presentMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (presentMs > 250.0 && slowLogged < 20)
         {
@@ -3495,8 +2276,7 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
 
     g_loopDone = true;
     Log("Shutting down%s", g_quitReq.load() ? " (stop shortcut)" : "");
-    // With some frame generation libraries (Nukem FG, FSR3-4 FG) closing takes long or ends in a crash while their DLLs unload.
-    // A watchdog ends the process with code 0 if the clean-up does not finish in time, so the launcher does not report an error.
+    // A watchdog prevents a stuck graphics-module detach from leaving the launcher waiting forever.
     std::thread([] {
         Sleep(2500);
         Log("Shutdown took too long: ending the process");
@@ -3524,18 +2304,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
-        // Defaults come from OptiCaptureHost.ini (written by the launcher); command-line options override them.
         oc::Settings settings;
         oc::LoadSettings(settings);
 
         Options opt;
-        opt.vsync = settings.vsync;
-        opt.menuKey = static_cast<int>(settings.menuKey);
         if (!ParseOptions(opt))
         {
-            Fail(L"Options:\n  --title <text>\n  --delay <seconds> (default 5)\n  --vsync 0|1 (default 1)\n  --buffers 2..4 (default 3)\n"
-                 L"  --gpu <index>\n  --no-clickthrough\n  --menu-key <virtual-key code, default 0x2D = Insert>\n"
-                 L"  --hwnd <window handle>  (used by the launcher)\n\nTip: use OptiCaptureLauncher.exe, it does all of this for you.");
+            Fail(L"Options:\n  --title <text>\n  --delay <seconds> (default 5)\n  --no-clickthrough\n"
+                 L"  --menu-key <virtual-key code, default Insert>\n  --hwnd <window handle>  (used by the launcher)\n"
+                 L"  --parent <process id>  (used by the launcher)\n\nTip: use OptiCaptureLauncher.exe.");
             return 2;
         }
 
@@ -3544,8 +2321,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
             Host host;
             rc = host.Run(opt, settings);
         }
-        // Leave without running the DLL detach code of OptiScaler and the frame generation libraries inside this process:
-        // some of them (Nukem FG, FSR3-4 FG) hang or crash there, which showed up as a red error in the launcher.
+        // Avoid DLL detach handlers in graphics modules loaded into the host process during shutdown.
         Log("Exit %d", rc);
         TerminateProcess(GetCurrentProcess(), static_cast<UINT>(rc));
         return rc;

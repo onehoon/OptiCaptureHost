@@ -1,8 +1,11 @@
 name: build
 
-# Builds only when you start them: Actions tab -> build -> Run workflow. It does NOT make a release.
-# Pushes and pull requests no longer start a build by themselves.
 on:
+  pull_request:
+    branches:
+      - feature/optiscaler-upstream
+      - refactor/upstream-provider-cleanup
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -10,44 +13,11 @@ permissions:
 
 jobs:
   windows:
+    name: Windows x64 Release
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
-      # NVIDIA's DLSS SDK (headers + static library), from NVIDIA's own public repository, pinned to one commit.
-      # If this step fails the host is built without DLSS (the host's log then says so).
-      - name: Fetch NVIDIA DLSS SDK
-        shell: pwsh
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $c = '374959484e79a640feaba44c93ac8cfb0a03f5b5'
-          New-Item -ItemType Directory -Force third_party/ngx/include, third_party/ngx/lib | Out-Null
-          $files = @{
-            'include/nvsdk_ngx.h' = 'include'; 'include/nvsdk_ngx_defs.h' = 'include'; 'include/nvsdk_ngx_defs_dlssd.h' = 'include'
-            'include/nvsdk_ngx_helpers.h' = 'include'; 'include/nvsdk_ngx_helpers_dlssd.h' = 'include'; 'include/nvsdk_ngx_params.h' = 'include'
-            'lib/Windows_x86_64/x64/nvsdk_ngx_s.lib' = 'lib'
-          }
-          $hdr = @{ Accept = 'application/vnd.github.raw'; Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'opticapturehost-ci' }
-          foreach ($f in $files.Keys) {
-            $out = "third_party/ngx/$($files[$f])/$(Split-Path $f -Leaf)"
-            try {
-              Invoke-WebRequest "https://api.github.com/repos/NVIDIA/DLSS/contents/$($f)?ref=$c" -Headers $hdr -OutFile $out
-            } catch { Write-Host "::warning::contents API failed for $f : $_" }
-            # a Git LFS pointer instead of the file: take the real one from the LFS media server
-            $isPointer = (Test-Path $out) -and ((Get-Item $out).Length -lt 400) -and ((Get-Content $out -TotalCount 1) -like 'version https://git-lfs*')
-            if (-not (Test-Path $out) -or $isPointer) {
-              try { Invoke-WebRequest "https://media.githubusercontent.com/media/NVIDIA/DLSS/$c/$f" -OutFile $out }
-              catch { Write-Host "::warning::could not fetch $f : $_" }
-            }
-          }
-          Get-ChildItem -Recurse third_party/ngx -File | ForEach-Object { Write-Host "$($_.FullName)  $($_.Length)" }
-          if (-not (Test-Path third_party/ngx/lib/nvsdk_ngx_s.lib) -or (Get-Item third_party/ngx/lib/nvsdk_ngx_s.lib).Length -lt 100000 -or -not (Test-Path third_party/ngx/include/nvsdk_ngx.h)) {
-            Write-Host "::warning::DLSS SDK files are missing or invalid; building without DLSS"
-            Remove-Item -Recurse -Force third_party/ngx -ErrorAction SilentlyContinue
-            exit 1
-          }
 
       - name: Configure
         run: cmake -S . -B build -A x64
@@ -55,18 +25,53 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Package
+      - name: Verify executables
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/OptiCaptureHost.exe dist/
-          Copy-Item build/Release/OptiCaptureLauncher.exe dist/
-          Copy-Item README.md dist/
-          Compress-Archive -Path dist/* -DestinationPath OptiCaptureHost-win64.zip -Force
+          $required = @(
+            'build/Release/OptiCaptureHost.exe',
+            'build/Release/OptiCaptureLauncher.exe'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Build output is missing: $path"
+            }
+          }
 
-      # No release is made automatically. The build is attached to the run: Actions tab -> the run -> Artifacts (OptiCaptureHost).
-      # Make the release yourself: Releases -> Draft a new release, and attach the files.
+      - name: Package development ZIP
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package/third_party/ffx | Out-Null
+          Copy-Item build/Release/OptiCaptureHost.exe package/
+          Copy-Item build/Release/OptiCaptureLauncher.exe package/
+          Copy-Item README.md package/
+          Copy-Item LICENSE package/
+          Copy-Item NOTICE.md package/
+          Copy-Item third_party/ffx/LICENSE.txt package/third_party/ffx/
+
+          $required = @(
+            'package/OptiCaptureHost.exe',
+            'package/OptiCaptureLauncher.exe',
+            'package/README.md',
+            'package/LICENSE',
+            'package/NOTICE.md',
+            'package/third_party/ffx/LICENSE.txt'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Package file is missing: $path"
+            }
+          }
+
+          Compress-Archive -Path package/* -DestinationPath OptiCaptureHost-win64.zip -Force
+          if (-not (Test-Path -LiteralPath 'OptiCaptureHost-win64.zip' -PathType Leaf)) {
+            throw 'Development ZIP was not created.'
+          }
+
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
         with:
-          name: OptiCaptureHost
-          path: dist
+          name: OptiCaptureHost-win64
+          path: OptiCaptureHost-win64.zip
+          retention-days: 3
