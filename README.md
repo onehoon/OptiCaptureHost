@@ -1,33 +1,56 @@
 # OptiCaptureHost
 
-OptiCaptureHost is a modified development fork exploring a Windows Graphics Capture baseline for an eventual upstream OptiScaler input provider. PR1 keeps the capture and display host buildable while removing fork-specific graphics controls. It does not establish compatibility with official OptiScaler V10.
+OptiCaptureHost is a modified development fork built around a Windows Graphics Capture baseline for OptiScaler input. It removes fork-specific graphics controls and supplies color-derived inputs through the public FidelityFX DX12 API. Hook interception, selected-upscaler evaluation and frame generation still require the maintainer's runtime verification.
 
 ## Current scope
 
 - `OptiCaptureLauncher.exe` lists visible windows, lets you select a target, choose native or scaled target resolution, start or stop capture, and configure host shortcuts.
 - `OptiCaptureHost.exe` captures the selected window with Windows Graphics Capture, shares the image between D3D11 and D3D12, and displays it in a borderless overlay.
 - Native mode leaves the target window size unchanged. Scaled target-resolution choices resize the target while capturing and restore its prior size when capture stops.
-- The host retains its GPU optical-flow and FFX temporal scaffold, including estimated motion vectors and synthetic depth. Those inputs and their interoperability with OptiScaler remain experimental and are not validated by PR1.
-- OptiScaler owns upscaling, frame generation, MFG, VSync, frame limits, latency and graphics settings. The launcher only reads OptiScaler's menu shortcut when relaying the menu key; it does not write or copy `OptiScaler.ini`.
+- The host generates color-derived motion vectors, a flat synthetic depth input and a reactive mask, then supplies them through the public FidelityFX DX12 API. OptiScaler owns the selected upscaler and all frame-generation, multiplier, VSync, frame-limit, latency, overlay and graphics settings.
+- The launcher only reads OptiScaler's menu shortcut when relaying the menu key; it does not write or copy `OptiScaler.ini`.
 
 ## Limitations and status
 
 - Use a windowed or borderless game. Exclusive fullscreen capture is not supported.
-- Motion vectors are estimated from captured color frames and depth is synthetic; they are not game-provided data.
-- Official OptiScaler V10 integration has not been verified. Native frame-generation-only passthrough is not implemented.
-- A compatible FidelityFX runtime may be supplied manually beside the executables to exercise the retained temporal scaffold. No runtime DLLs are included in this repository or the development ZIP.
+- Motion vectors are estimated from captured color frames and depth is flat synthetic depth; neither is game-provided data. Jitter is not synthesized.
+- The host sends a native FidelityFX upscaler context and dispatch through the same D3D12 device, command list and queue used for presentation. Hook interception and successful OptiScaler evaluation still require the maintainer's runtime verification.
+- Native frame-generation-only passthrough is not implemented. No OptiScaler, FidelityFX, XeSS, XeFG, XeLL, DLSS or other runtime DLLs are included in this repository or the development ZIP.
 
-## Manual runtime checks
+## Manual OptiScaler V10 setup and maintainer checks
 
-On a Windows desktop, use a disposable windowed target and check the following:
+Runtime verification is for the maintainer. Codex validation is limited to source review, compilation and CI/package checks; host, game, OptiScaler, smoke and GPU tests are not run by Codex.
 
-1. With OptiScaler absent, start native capture, confirm the image and capture log, stop, and repeat start/stop.
-2. Try each scaled target size. Confirm the target resizes for capture and returns to its original size and placement after stop.
-3. Resize the target during capture, then close it during a separate run. Confirm the overlay follows geometry changes and the host exits cleanly when the target closes.
-4. Compare `OptiScaler.ini` before and after launcher start/stop to verify it remains unchanged.
-5. With a compatible FidelityFX runtime beside the executables, confirm successful temporal dispatches are visible; if dispatch fails, confirm the log reports a fallback and the captured frame remains visible.
+Install the unmodified official OptiScaler V10 `dxgi.dll` beside `OptiCaptureHost.exe`, never in the target game's folder. Supply a compatible FidelityFX runtime next to the host: prefer a matching `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll` pair, or use the supported monolithic `amd_fidelityfx_dx12.dll` fallback. Do not mix DLLs from different runtime packages. The host does not download, copy or configure these files.
 
-Keep official OptiScaler V10 interoperability and frame-generation checks separate; they are not established by this PR.
+Use OptiScaler's supplied INI, manual edits or its overlay. For the initial XeSS input check, start with a scaled target such as 67% input to native monitor output, and use:
+
+```ini
+[Upscalers]
+Dx12Upscaler=xess
+
+[Inputs]
+EnableFfxInputs=true
+UseFfxInputs=true
+EnableHotSwapping=false
+
+[FrameGen]
+Enabled=false
+FGInput=upscaler
+FGOutput=xefg
+
+[XeFG]
+InterpolationCount=1
+DynamicMFG=false
+```
+
+1. Without OptiScaler/FFX, check native and scaled capture, repeated start/stop, target resize and target close.
+2. With FG disabled, verify OptiScaler's official log and overlay show FFX DX12 input, XeSS output, successful feature creation/evaluation and visibly upscaled output. Confirm the displayed image is not the raw neutral blit or an unhooked standalone AMD upscaler.
+3. Enable FG in OptiScaler and restart the host when its swapchain settings require it. XeFG requires `libxess_fg.dll` and `libxell.dll`; XeSS requires its matching SDK. Confirm XeFG initializes and generated frames are presented at 2x, then test 3x and 4x where the SDK and GPU support them (`InterpolationCount=1`, `2` and `3`). Do not add unlocker support, force `IgnoreInitChecks`, or select unsupported backends/GPU modes.
+4. FSR4 can be checked with `Dx12Upscaler=ffx` and the official supported provider/model configuration when compatible hardware and runtime are available. DLSS on compatible RTX hardware is an optional later check, not an Intel PoC requirement.
+5. Record source capture FPS separately from displayed/generated FPS, official logs, visual behavior, HUD/ghosting, menu/focus toggles, alt-tab and restart behavior. Report FSR4 only when confirmed on a supported runtime.
+
+Runtime validation remains pending maintainer testing. No automatic INI modification or launcher graphics settings are provided.
 
 For OptiScaler setup, obtain the official project and follow its own installation instructions: [optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler). This host does not install, update, or configure OptiScaler. Set source-game frame limits in the game itself; OptiScaler limits the host process.
 
