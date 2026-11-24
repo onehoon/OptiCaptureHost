@@ -235,7 +235,9 @@ void App::Start()
     const GameItem game=games_[selected_]; if (!IsWindow(game.hwnd)) { Refresh(); SetNote(L"That window has closed. Refresh the list.",true); return; }
     const std::wstring dir=oc::ExeDir(), hostPath=dir+kHostExe;
     if (GetFileAttributesW(hostPath.c_str())==INVALID_FILE_ATTRIBUTES) { SetNote(L"OptiCaptureHost.exe was not found next to the launcher.",true); return; }
-    target_=game.hwnd; if (settings_.targetScale) ResizeTargetWindow(game);
+    target_=game.hwnd;
+    if (settings_.targetScale) ResizeTargetWindow(game);
+    else if (IsIconic(game.hwnd)) ShowWindow(game.hwnd,SW_RESTORE);
     const UINT menuKey=ReadOptiScalerMenuKey(); wchar_t key[8]={}; swprintf_s(key,L"%02X",menuKey);
     const std::wstring cmd=L"\""+hostPath+L"\" --hwnd "+std::to_wstring(reinterpret_cast<ULONG_PTR>(game.hwnd))+L" --parent "+
         std::to_wstring(GetCurrentProcessId())+L" --menu-key 0x"+key;

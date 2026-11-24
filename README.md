@@ -25,6 +25,7 @@ On a Windows desktop, use a disposable windowed target and check the following:
 2. Try each scaled target size. Confirm the target resizes for capture and returns to its original size and placement after stop.
 3. Resize the target during capture, then close it during a separate run. Confirm the overlay follows geometry changes and the host exits cleanly when the target closes.
 4. Compare `OptiScaler.ini` before and after launcher start/stop to verify it remains unchanged.
+5. With a compatible FidelityFX runtime beside the executables, confirm successful temporal dispatches are visible; if dispatch fails, confirm the log reports a fallback and the captured frame remains visible.
 
 Keep official OptiScaler V10 interoperability and frame-generation checks separate; they are not established by this PR.
 

@@ -359,8 +359,8 @@ class Host
     bool InitFsrPipelines();
     bool InitFsrTemporal();
     void ReleaseFsrTemporal();
-    void RecordFsrTemporal();
-    void RecordBlit(ID3D12Resource* bb, UINT idx);
+    bool RecordFsrTemporal();
+    void RecordBlit(ID3D12Resource* bb, UINT idx, bool temporalOutput);
     void OverlayPlace(const RECT& game, int& x, int& y);
     bool CreateShared();
     bool PresentFrame(ID3D11Texture2D* src);
@@ -387,12 +387,13 @@ class Host
     UINT height_ = 0;
     // Resolution choices resize the target window in the launcher; scaled choices use this neutral bilinear blit.
     bool scaleOn_ = false;
+    bool blitReady_ = false;
     UINT outW_ = 0;
     UINT outH_ = 0;
     ComPtr<ID3D12RootSignature> blitRoot_;
     ComPtr<ID3D12PipelineState> blitPso_;
     ComPtr<ID3D12DescriptorHeap> srvHeap_, rtvHeap_;
-    // The FFX context consumes estimated vectors/depth and writes its temporal output for the next input-bridge step.
+    // The FFX context consumes estimated vectors/depth and writes its temporal output for display.
     HMODULE ffxModule_ = nullptr;
     ffxFunctions ffxFn_{};
     ffxContext ffxCtx_ = nullptr;
@@ -683,10 +684,16 @@ bool Host::InitOverlayAndSwapChain()
             return false;
         outW_ = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
         outH_ = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
-        if (!InitBlit())
-            return false;
-        Log("Target resolution mode %d: neutral blit %ux%u -> %ux%u", st_.targetScale, width_, height_, outW_, outH_);
     }
+    blitReady_ = InitBlit();
+    if (!blitReady_)
+    {
+        if (scaleOn_)
+            return false;
+        Log("Neutral blit is unavailable; native capture remains on the raw path");
+    }
+    if (scaleOn_)
+        Log("Target resolution mode %d: neutral blit %ux%u -> %ux%u", st_.targetScale, width_, height_, outW_, outH_);
     else
     {
         Log("Native target resolution: %ux%u", width_, height_);
@@ -1166,8 +1173,8 @@ bool Host::InitFsrTemporal()
     return true;
 }
 
-// Per frame, copy the capture, estimate motion and depth, then exercise the retained FFX temporal context.
-void Host::RecordFsrTemporal()
+// Per frame, copy the capture, estimate motion and depth, then dispatch the retained FFX temporal context.
+bool Host::RecordFsrTemporal()
 {
     auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
         D3D12_RESOURCE_BARRIER b{};
@@ -1250,12 +1257,15 @@ void Host::RecordFsrTemporal()
     const ffxReturnCode_t rc = ffxFn_.Dispatch(&ffxCtx_, &d.header);
     if (rc != FFX_API_RETURN_OK)
     {
-        static int logged = 0;
-        if (logged++ < 5)
-            Log("FFX flow: dispatch failed (code %u)", static_cast<unsigned>(rc));
+        Log("FFX flow: dispatch failed (code %u); falling back to the captured frame", static_cast<unsigned>(rc));
+        barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        fsrReady_ = false;
+        fsrHavePrev_ = false;
+        return false;
     }
     barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     fsrHavePrev_ = true;
+    return true;
 }
 
 // The shared texture is recreated whenever the game's picture size changes: point SRV 0 at the new one.
@@ -1277,7 +1287,7 @@ bool Host::CreateFsrViews()
     return true;
 }
 
-void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index)
+void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index, bool temporalOutput)
 {
     auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
         D3D12_RESOURCE_BARRIER barrier{};
@@ -1292,7 +1302,8 @@ void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(index) * rtvInc_;
     dev12_->CreateRenderTargetView(backBuffer, nullptr, rtv);
-    transition(shared12_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (!temporalOutput)
+        transition(shared12_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     transition(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
     ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
@@ -1305,10 +1316,14 @@ void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index)
     list_->RSSetViewports(1, &viewport);
     list_->RSSetScissorRects(1, &scissor);
     list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    list_->SetGraphicsRootDescriptorTable(0, srvHeap_->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    if (temporalOutput)
+        srv.ptr += static_cast<UINT64>(srvInc_) * 6;
+    list_->SetGraphicsRootDescriptorTable(0, srv);
     list_->DrawInstanced(3, 1, 0, 0);
 
-    transition(shared12_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (!temporalOutput)
+        transition(shared12_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 }
 
@@ -1432,11 +1447,10 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
     if (tsHeap_)
         list_->EndQuery(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, idx * 2);
 
-    if (fsrReady_)
-        RecordFsrTemporal();
-    if (scaleOn_)
+    const bool temporalOutput = blitReady_ && fsrReady_ && RecordFsrTemporal();
+    if (scaleOn_ || temporalOutput)
     {
-        RecordBlit(bb.Get(), idx);
+        RecordBlit(bb.Get(), idx, temporalOutput);
     }
     else
     {
