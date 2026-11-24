@@ -1,6 +1,6 @@
 // OptiCaptureHost
 // OptiCaptureHost captures one window with Windows Graphics Capture and displays it in a
-// borderless D3D12 overlay. Its FFX optical-flow and temporal scaffold is retained for follow-up work.
+// borderless D3D12 overlay that supplies captured frames to OptiScaler's FFX input path.
 
 #include <windows.h>
 #include <shellapi.h>
@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -38,11 +39,8 @@
 
 #include "settings.h"
 #include "blit_shader.h"
-#include "fsr_flow_shader.h"
-#include "ffx_api/ffx_api.h"
-#include "ffx_api/ffx_upscale.h"
-#include "ffx_api/ffx_api_loader.h"
-#include "ffx_api/dx12/ffx_api_dx12.h"
+#include "ffx_input_bridge.h"
+#include "optical_flow_engine.h"
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -325,6 +323,8 @@ HWND PickTarget(const Options& o)
     return h;
 }
 
+void FfxMessage(uint32_t type, const wchar_t* message);
+
 // ---------------------------------------------------------------------------------------------------------------
 // The host
 // ---------------------------------------------------------------------------------------------------------------
@@ -355,15 +355,12 @@ class Host
     bool InitCapture();
     bool InitOverlayAndSwapChain();
     bool InitBlit();
-    bool CreateFsrViews();
-    bool InitFsrPipelines();
-    bool InitFsrTemporal();
-    void ReleaseFsrTemporal();
-    bool RecordFsrTemporal();
+    bool CreateFrameResources(UINT bufferCount);
+    bool CreateBlitViews();
     void RecordBlit(ID3D12Resource* bb, UINT idx, bool temporalOutput);
     void OverlayPlace(const RECT& game, int& x, int& y);
     bool CreateShared();
-    bool PresentFrame(ID3D11Texture2D* src);
+    bool PresentFrame(ID3D11Texture2D* src, long long sourceTimestamp100ns);
     bool ComputeCrop(UINT capW, UINT capH, int& cx, int& cy, UINT& w, UINT& h);
     bool ApplyGeometry(UINT capW, UINT capH);
     bool RefreshGeometry();
@@ -374,8 +371,9 @@ class Host
     bool ForceForeground(HWND h);
     void OpenMenu();
     void SendMenuKey(bool up);
-    void WaitFenceValue(UINT64 v);
-    void WaitGpu();
+    bool WaitFenceValue(UINT64 v);
+    bool WaitSharedFenceValue(UINT64 v);
+    bool WaitGpu();
     void Shutdown();
     void PublishLive(std::chrono::steady_clock::time_point now);
 
@@ -393,21 +391,11 @@ class Host
     ComPtr<ID3D12RootSignature> blitRoot_;
     ComPtr<ID3D12PipelineState> blitPso_;
     ComPtr<ID3D12DescriptorHeap> srvHeap_, rtvHeap_;
-    // The FFX context consumes estimated vectors/depth and writes its temporal output for display.
-    HMODULE ffxModule_ = nullptr;
-    ffxFunctions ffxFn_{};
-    ffxContext ffxCtx_ = nullptr;
-    ComPtr<ID3D12RootSignature> fsrRoot_;
-    ComPtr<ID3D12PipelineState> fsrBlockPso_, fsrPixelPso_;
-    ComPtr<ID3D12Resource> fsrTex_[2], fsrBlk_, fsrMv_, fsrDepth_, fsrReact_, fsrOut_;
-    bool fsrPipesOk_ = false;
-    bool fsrReady_ = false;
-    bool fsrHavePrev_ = false;
-    bool ffxUnavailableLogged_ = false;
-    int fsrCur_ = 1;
-    std::chrono::steady_clock::time_point fsrLast_{};
+    oc::OpticalFlowEngine opticalFlow_;
+    oc::FfxInputBridge ffxBridge_;
     UINT srvInc_ = 0;
     UINT rtvInc_ = 0;
+    UINT rtvCapacity_ = 0;
     bool interactive_ = false;
     int menuKeyStage_ = 0; // 0 idle, 1 waiting to press the menu key, 2 waiting to release it
     std::chrono::steady_clock::time_point menuKeyAt_{};
@@ -491,6 +479,7 @@ class Host
     ComPtr<ID3D11Fence> fence11_;
     ComPtr<ID3D12Fence> fence12_;
     UINT64 sharedFenceValue_ = 0;
+    UINT64 sharedReleaseValue_ = 0;
     ComPtr<ID3D11Texture2D> shared11_;
     ComPtr<ID3D12Resource> shared12_;
 
@@ -539,6 +528,11 @@ bool Host::InitGraphics()
     if (FAILED(hr))
         return false;
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fenceEvent_)
+    {
+        Log("Fence event creation failed: %lu", GetLastError());
+        return false;
+    }
 
     // D3D11 device on the same adapter, for Windows Graphics Capture.
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
@@ -747,41 +741,15 @@ bool Host::InitOverlayAndSwapChain()
     if (FAILED(sc1.As(&swap_)))
         return false;
 
-    allocs_.resize(sd.BufferCount);
-    allocFence_.assign(sd.BufferCount, 0);
-    for (auto& allocator : allocs_)
-        if (FAILED(dev12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
-            return false;
-    if (FAILED(dev12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs_[0].Get(), nullptr, IID_PPV_ARGS(&list_))))
-        return false;
-    list_->Close();
-
-    tsHeap_.Reset();
-    tsRead_.Reset();
+    DXGI_SWAP_CHAIN_DESC1 actualDesc{};
+    if (FAILED(swap_->GetDesc1(&actualDesc)) || actualDesc.BufferCount == 0)
     {
-        D3D12_QUERY_HEAP_DESC qh{};
-        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = sd.BufferCount * 2;
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC rd{};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = static_cast<UINT64>(sd.BufferCount) * 16;
-        rd.Height = 1;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_UNKNOWN;
-        rd.SampleDesc.Count = 1;
-        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (!(SUCCEEDED(dev12_->CreateQueryHeap(&qh, IID_PPV_ARGS(&tsHeap_))) &&
-              SUCCEEDED(dev12_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                        IID_PPV_ARGS(&tsRead_))) &&
-              SUCCEEDED(queue_->GetTimestampFrequency(&tsFreq_)) && tsFreq_ != 0))
-        {
-            tsHeap_.Reset();
-            tsRead_.Reset();
-        }
+        Log("Swap chain returned an invalid buffer count");
+        return false;
     }
+    Log("Swap chain buffers: %u", actualDesc.BufferCount);
+    if (!CreateFrameResources(actualDesc.BufferCount))
+        return false;
     ShowWindow(overlay_, SW_SHOWNOACTIVATE);
     return CreateShared();
 }
@@ -792,7 +760,7 @@ bool Host::InitBlit()
     {
         D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
         srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srvHeap.NumDescriptors = 17;
+        srvHeap.NumDescriptors = 2;
         srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(dev12_->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&srvHeap_))))
             return false;
@@ -860,11 +828,14 @@ bool Host::InitBlit()
     heap.NumDescriptors = 32;
     if (FAILED(dev12_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_))))
         return false;
+    rtvCapacity_ = heap.NumDescriptors;
     rtvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     return true;
 }
 bool Host::CreateShared()
 {
+    ffxBridge_.ReleaseContext();
+    opticalFlow_.Release();
     shared11_.Reset();
     shared12_.Reset();
 
@@ -905,13 +876,20 @@ bool Host::CreateShared()
         Log("OpenSharedHandle (texture) failed: 0x%08X", static_cast<unsigned>(hr));
         return false;
     }
-    if (!fsrPipesOk_)
+    if (blitReady_)
     {
-        fsrPipesOk_ = InitFsrPipelines();
-        if (!fsrPipesOk_)
-            Log("FFX optical-flow shaders are unavailable; capture remains on the raw path");
+        if (!opticalFlow_.Initialize(dev12_.Get(), width_, height_, Log))
+            Log("Optical flow is unavailable; capture remains on the raw path");
+        if (opticalFlow_.Ready())
+        {
+            DXGI_ADAPTER_DESC1 adapterDesc{};
+            adapter_->GetDesc1(&adapterDesc);
+            const std::string adapterName = Narrow(adapterDesc.Description);
+            if (!ffxBridge_.Initialize(dev12_.Get(), width_, height_, outW_, outH_, adapterName.c_str(), Log, FfxMessage))
+                Log("FFX input bridge is unavailable; displaying captured frames directly");
+        }
     }
-    if (srvHeap_ && !CreateFsrViews())
+    if (srvHeap_ && !CreateBlitViews())
         return false;
     return true;
 }
@@ -934,359 +912,96 @@ void Host::OverlayPlace(const RECT& game, int& x, int& y)
     y = game.top + cropY_;
 }
 
-// FFX flow: the two compute passes that measure motion (fsr_flow_shader.h).
-bool Host::InitFsrPipelines()
-{
-    if (!srvHeap_)
-    {
-        D3D12_DESCRIPTOR_HEAP_DESC heap{};
-        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heap.NumDescriptors = 17;
-        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(dev12_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&srvHeap_))))
-            return false;
-        srvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    }
-    fsrRoot_.Reset();
-    fsrBlockPso_.Reset();
-    fsrPixelPso_.Reset();
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 3;
-    ranges[0].OffsetInDescriptorsFromTableStart = 0;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 4;
-    ranges[1].OffsetInDescriptorsFromTableStart = 0;
-    D3D12_ROOT_PARAMETER rp[3]{};
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[0].Constants.Num32BitValues = 4;
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[1].DescriptorTable.NumDescriptorRanges = 1;
-    rp[1].DescriptorTable.pDescriptorRanges = &ranges[0];
-    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[2].DescriptorTable.NumDescriptorRanges = 1;
-    rp[2].DescriptorTable.pDescriptorRanges = &ranges[1];
-    D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 3;
-    rsd.pParameters = rp;
-    ComPtr<ID3DBlob> sig, err;
-    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
-        FAILED(dev12_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&fsrRoot_))))
-    {
-        Log("FFX flow: root signature failed");
-        return false;
-    }
-    auto make = [&](const char* entry, ComPtr<ID3D12PipelineState>& pso) {
-        ComPtr<ID3DBlob> cs, e;
-        std::string src(kFsrFlowHlsl);
-        const HRESULT h = D3DCompile(src.c_str(), src.size(), "fsr_flow.hlsl", nullptr, nullptr, entry, "cs_5_0",
-                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e);
-        if (FAILED(h))
-        {
-            Log("FFX flow: shader %s failed: 0x%08X %s", entry, static_cast<unsigned>(h),
-                e ? static_cast<const char*>(e->GetBufferPointer()) : "");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-        pd.pRootSignature = fsrRoot_.Get();
-        pd.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
-        const HRESULT h2 = dev12_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso));
-        if (FAILED(h2))
-            Log("FFX flow: pipeline %s failed: 0x%08X", entry, static_cast<unsigned>(h2));
-        return SUCCEEDED(h2);
-    };
-    if (!(make("CSBlock", fsrBlockPso_) && make("CSPixel", fsrPixelPso_)))
-        return false;
-    return true;
-}
-
-static void FfxMessage(uint32_t type, const wchar_t* message)
+void FfxMessage(uint32_t type, const wchar_t* message)
 {
     if (!message)
         return;
     char text[400] = {};
     WideCharToMultiByte(CP_UTF8, 0, message, -1, text, static_cast<int>(sizeof(text)) - 1, nullptr, nullptr);
-    Log("FSR %s: %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", text);
+    Log("FFX %s: %s", type == 0 ? "error" : "warning", text);
 }
 
-void Host::ReleaseFsrTemporal()
-{
-    fsrReady_ = false;
-    fsrHavePrev_ = false;
-    if (ffxCtx_ && ffxFn_.DestroyContext)
-        ffxFn_.DestroyContext(&ffxCtx_, nullptr);
-    ffxCtx_ = nullptr;
-    fsrTex_[0].Reset();
-    fsrTex_[1].Reset();
-    fsrBlk_.Reset();
-    fsrMv_.Reset();
-    fsrDepth_.Reset();
-    fsrReact_.Reset();
-    fsrOut_.Reset();
-}
-
-// The captured frame's size is fixed per shared texture: everything that depends on it (frame copies, vectors, depth, output and AMD's
-// context) is made again whenever the shared texture is.
-bool Host::InitFsrTemporal()
-{
-    if (!fsrPipesOk_ || !srvHeap_)
-        return false;
-    WaitGpu();
-    ReleaseFsrTemporal();
-
-    if (!ffxModule_)
-    {
-        const std::wstring root = oc::ExeDir();
-        const wchar_t* files[] = { L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll" };
-        for (const wchar_t* file : files)
-        {
-            const std::wstring path = root + file;
-            if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES)
-                continue;
-            HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-            if (!module)
-            {
-                Log("FFX runtime %ls could not be loaded (error %lu)", path.c_str(), GetLastError());
-                continue;
-            }
-            ffxFunctions functions{};
-            ffxLoadFunctions(&functions, module);
-            if (!functions.CreateContext || !functions.DestroyContext || !functions.Dispatch)
-            {
-                Log("FFX runtime %ls does not expose the required API", path.c_str());
-                FreeLibrary(module);
-                continue;
-            }
-            ffxModule_ = module;
-            ffxFn_ = functions;
-            Log("FFX runtime %ls", path.c_str());
-            break;
-        }
-        if (!ffxModule_)
-        {
-            if (!ffxUnavailableLogged_)
-            {
-                Log("FFX runtime is unavailable; place a compatible amd_fidelityfx_dx12.dll next to the executables to exercise the temporal scaffold");
-                ffxUnavailableLogged_ = true;
-            }
-            return false;
-        }
-    }
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    auto make = [&](ComPtr<ID3D12Resource>& r, UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES st) {
-        D3D12_RESOURCE_DESC d{};
-        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        d.Width = w;
-        d.Height = h;
-        d.DepthOrArraySize = 1;
-        d.MipLevels = 1;
-        d.Format = fmt;
-        d.SampleDesc.Count = 1;
-        d.Flags = flags;
-        return SUCCEEDED(dev12_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, st, nullptr, IID_PPV_ARGS(&r)));
-    };
-    const UINT bw = (width_ + 3) / 4, bh = (height_ + 3) / 4;
-    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (!make(fsrTex_[0], width_, height_, kFormat, D3D12_RESOURCE_FLAG_NONE, nps) ||
-        !make(fsrTex_[1], width_, height_, kFormat, D3D12_RESOURCE_FLAG_NONE, nps) ||
-        !make(fsrBlk_, bw, bh, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, nps) ||
-        !make(fsrMv_, width_, height_, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, nps) ||
-        !make(fsrDepth_, width_, height_, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, nps) ||
-        !make(fsrReact_, width_, height_, DXGI_FORMAT_R8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, nps) ||
-        !make(fsrOut_, outW_, outH_, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
-    {
-        Log("FFX flow: textures could not be made");
-        ReleaseFsrTemporal();
-        return false;
-    }
-
-    // FFX descriptor layout.
-    auto cpu = [&](UINT n) {
-        D3D12_CPU_DESCRIPTOR_HANDLE h = srvHeap_->GetCPUDescriptorHandleForHeapStart();
-        h.ptr += static_cast<SIZE_T>(srvInc_) * n;
-        return h;
-    };
-    auto srv = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT n) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = fmt;
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        sv.Texture2D.MipLevels = 1;
-        dev12_->CreateShaderResourceView(r, &sv, cpu(n));
-    };
-    auto uav = [&](ID3D12Resource* r, DXGI_FORMAT fmt, UINT n) {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
-        uv.Format = fmt;
-        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        dev12_->CreateUnorderedAccessView(r, nullptr, &uv, cpu(n));
-    };
-    srv(fsrOut_.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 6);
-    srv(fsrTex_[0].Get(), kFormat, 7);
-    srv(fsrTex_[1].Get(), kFormat, 8);
-    srv(fsrBlk_.Get(), DXGI_FORMAT_R16G16_FLOAT, 9);
-    uav(fsrBlk_.Get(), DXGI_FORMAT_R16G16_FLOAT, 10);
-    uav(fsrMv_.Get(), DXGI_FORMAT_R16G16_FLOAT, 11);
-    uav(fsrDepth_.Get(), DXGI_FORMAT_R32_FLOAT, 12);
-    uav(fsrReact_.Get(), DXGI_FORMAT_R8_UNORM, 13);
-    srv(fsrTex_[1].Get(), kFormat, 14);
-    srv(fsrTex_[0].Get(), kFormat, 15);
-    srv(fsrBlk_.Get(), DXGI_FORMAT_R16G16_FLOAT, 16);
-
-    // FFX temporal context: gamma-encoded colour, estimated motion vectors, synthetic depth, and no jitter
-    ffxCreateBackendDX12Desc backendDesc{};
-    backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
-    backendDesc.device = dev12_.Get();
-    // FidelityFX API 4.1.1 runtimes use this version descriptor: type 0x0001000b.
-    struct VersionDesc { ffxCreateContextDescHeader header; uint32_t version; } versionDesc{};
-    versionDesc.header.type = 0x0001000bu;
-    versionDesc.version = (4u << 22) | (1u << 12) | 1u;
-    versionDesc.header.pNext = &backendDesc.header;
-    ffxCreateContextDescUpscale desc{};
-    desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    desc.header.pNext = &versionDesc.header;
-    desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
-    desc.maxRenderSize = { width_, height_ };
-    desc.maxUpscaleSize = { outW_, outH_ };
-    desc.fpMessage = FfxMessage;
-    const ffxReturnCode_t rc = ffxFn_.CreateContext(&ffxCtx_, &desc.header, nullptr);
-    if (rc != FFX_API_RETURN_OK || !ffxCtx_)
-    {
-        ffxCtx_ = nullptr;
-        Log("FFX flow: AMD's runtime could not make its upscaling context (code %u)", static_cast<unsigned>(rc));
-        ReleaseFsrTemporal();
-        return false;
-    }
-    if (ffxFn_.Query)
-    {
-        ffxQueryGetProviderVersion used{};
-        used.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        if (ffxFn_.Query(&ffxCtx_, &used.header) == FFX_API_RETURN_OK && used.versionName)
-            Log("FFX flow: the runtime runs %s", used.versionName);
-    }
-    fsrReady_ = true;
-    fsrHavePrev_ = false;
-    fsrCur_ = 1;
-    fsrLast_ = std::chrono::steady_clock::now();
-    Log("FFX flow: %ux%u -> %ux%u", width_, height_, outW_, outH_);
-    return true;
-}
-
-// Per frame, copy the capture, estimate motion and depth, then dispatch the retained FFX temporal context.
-bool Host::RecordFsrTemporal()
-{
-    auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = r;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        b.Transition.StateBefore = from;
-        b.Transition.StateAfter = to;
-        list_->ResourceBarrier(1, &b);
-    };
-    const D3D12_RESOURCE_STATES nps = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-    fsrCur_ ^= 1;
-    ID3D12Resource* curTex = fsrTex_[fsrCur_].Get();
-    barrier(curTex, nps, D3D12_RESOURCE_STATE_COPY_DEST);
-    list_->CopyResource(curTex, shared12_.Get());
-    barrier(curTex, D3D12_RESOURCE_STATE_COPY_DEST, nps);
-
-    ID3D12DescriptorHeap* heaps[] = { srvHeap_.Get() };
-    list_->SetDescriptorHeaps(1, heaps);
-    list_->SetComputeRootSignature(fsrRoot_.Get());
-    const D3D12_GPU_DESCRIPTOR_HANDLE base = srvHeap_->GetGPUDescriptorHandleForHeapStart();
-    auto slot = [&](UINT n) {
-        D3D12_GPU_DESCRIPTOR_HANDLE h = base;
-        h.ptr += static_cast<UINT64>(srvInc_) * n;
-        return h;
-    };
-    const UINT bw = (width_ + 3) / 4, bh = (height_ + 3) / 4;
-    const UINT consts[4] = { width_, height_, bw, bh };
-    list_->SetComputeRoot32BitConstants(0, 4, consts, 0);
-    list_->SetComputeRootDescriptorTable(1, slot(fsrCur_ == 0 ? 7 : 14)); // current frame, frame before, block vectors
-    list_->SetComputeRootDescriptorTable(2, slot(10));
-
-    barrier(fsrBlk_.Get(), nps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list_->SetPipelineState(fsrBlockPso_.Get());
-    list_->Dispatch((bw + 7) / 8, (bh + 7) / 8, 1);
-    barrier(fsrBlk_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
-
-    barrier(fsrMv_.Get(), nps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    barrier(fsrDepth_.Get(), nps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    barrier(fsrReact_.Get(), nps, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list_->SetPipelineState(fsrPixelPso_.Get());
-    list_->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
-    barrier(fsrMv_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
-    barrier(fsrDepth_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
-    barrier(fsrReact_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nps);
-
-    const auto now = std::chrono::steady_clock::now();
-    float frameMs = static_cast<float>(std::chrono::duration<double, std::milli>(now - fsrLast_).count());
-    fsrLast_ = now;
-    // Use the WGC source-frame interval to reduce CPU scheduling jitter in the temporal input timing.
-    if (!srcGaps_.empty() && srcGaps_.back() >= 2.0 && srcGaps_.back() <= 100.0)
-        frameMs = static_cast<float>(0.7 * srcGaps_.back() + 0.3 * frameMs);
-    if (frameMs < 1.0f || frameMs > 250.0f)
-        frameMs = 16.666f;
-
-    barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    ffxDispatchDescUpscale d{};
-    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    d.commandList = list_.Get();
-    d.color = ffxApiGetResourceDX12(curTex, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.depth = ffxApiGetResourceDX12(fsrDepth_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.motionVectors = ffxApiGetResourceDX12(fsrMv_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    d.reactive = ffxApiGetResourceDX12(fsrReact_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ); // where the motion cannot be trusted
-    d.output = ffxApiGetResourceDX12(fsrOut_.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-    d.jitterOffset = { 0.0f, 0.0f };
-    d.motionVectorScale = { 1.0f, -1.0f }; // sub-pixel vectors with inverted Y for D3D12
-    d.renderSize = { width_, height_ };
-    d.upscaleSize = { outW_, outH_ };
-    d.enableSharpening = false;
-    d.sharpness = 0.0f;
-    d.frameTimeDelta = frameMs;
-    d.preExposure = 1.0f;
-    d.reset = !fsrHavePrev_;
-    d.cameraNear = 0.1f;
-    d.cameraFar = 1000.0f;
-    d.cameraFovAngleVertical = 1.04719755f; // 60 degrees in radians
-    d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
-    const ffxReturnCode_t rc = ffxFn_.Dispatch(&ffxCtx_, &d.header);
-    if (rc != FFX_API_RETURN_OK)
-    {
-        Log("FFX flow: dispatch failed (code %u); falling back to the captured frame", static_cast<unsigned>(rc));
-        barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        fsrReady_ = false;
-        fsrHavePrev_ = false;
-        return false;
-    }
-    barrier(fsrOut_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    fsrHavePrev_ = true;
-    return true;
-}
-
-// The shared texture is recreated whenever the game's picture size changes: point SRV 0 at the new one.
-bool Host::CreateFsrViews()
+bool Host::CreateBlitViews()
 {
     if (!srvHeap_ || !shared12_)
         return false;
+
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = kFormat;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
-    dev12_->CreateShaderResourceView(shared12_.Get(), &view, srvHeap_->GetCPUDescriptorHandleForHeapStart());
-    if (fsrPipesOk_ && !InitFsrTemporal() && !ffxUnavailableLogged_)
-    {
-        Log("FFX temporal runtime is unavailable; displaying the captured frame directly");
-        ffxUnavailableLogged_ = true;
-    }
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+    dev12_->CreateShaderResourceView(shared12_.Get(), &view, handle);
+
+    view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    handle.ptr += srvInc_;
+    dev12_->CreateShaderResourceView(ffxBridge_.Ready() ? ffxBridge_.Output() : nullptr, &view, handle);
     return true;
 }
 
+bool Host::CreateFrameResources(UINT bufferCount)
+{
+    if (bufferCount == 0)
+        return false;
+
+    list_.Reset();
+    allocs_.clear();
+    allocFence_.assign(bufferCount, 0);
+    allocs_.resize(bufferCount);
+    for (auto& allocator : allocs_)
+    {
+        if (FAILED(dev12_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
+        {
+            Log("Command allocator creation failed");
+            return false;
+        }
+    }
+    if (FAILED(dev12_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs_[0].Get(), nullptr, IID_PPV_ARGS(&list_))))
+        return false;
+    if (FAILED(list_->Close()))
+        return false;
+
+    tsHeap_.Reset();
+    tsRead_.Reset();
+    tsFreq_ = 0;
+    D3D12_QUERY_HEAP_DESC queryDesc{};
+    queryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    queryDesc.Count = bufferCount * 2;
+    D3D12_HEAP_PROPERTIES readbackHeap{};
+    readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC readbackDesc{};
+    readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackDesc.Width = static_cast<UINT64>(bufferCount) * 16;
+    readbackDesc.Height = 1;
+    readbackDesc.DepthOrArraySize = 1;
+    readbackDesc.MipLevels = 1;
+    readbackDesc.Format = DXGI_FORMAT_UNKNOWN;
+    readbackDesc.SampleDesc.Count = 1;
+    readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (!(SUCCEEDED(dev12_->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&tsHeap_))) &&
+          SUCCEEDED(dev12_->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tsRead_))) &&
+          SUCCEEDED(queue_->GetTimestampFrequency(&tsFreq_)) && tsFreq_ != 0))
+    {
+        tsHeap_.Reset();
+        tsRead_.Reset();
+        tsFreq_ = 0;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
+    rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtvDesc.NumDescriptors = bufferCount;
+    if (rtvCapacity_ < bufferCount || !rtvHeap_)
+    {
+        rtvHeap_.Reset();
+        if (FAILED(dev12_->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&rtvHeap_))))
+            return false;
+        rtvCapacity_ = bufferCount;
+        rtvInc_ = dev12_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+    return true;
+}
 void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index, bool temporalOutput)
 {
     auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
@@ -1318,7 +1033,7 @@ void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index, bool temporalOutpu
     list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     D3D12_GPU_DESCRIPTOR_HANDLE srv = srvHeap_->GetGPUDescriptorHandleForHeapStart();
     if (temporalOutput)
-        srv.ptr += static_cast<UINT64>(srvInc_) * 6;
+        srv.ptr += srvInc_;
     list_->SetGraphicsRootDescriptorTable(0, srv);
     list_->DrawInstanced(3, 1, 0, 0);
 
@@ -1327,26 +1042,60 @@ void Host::RecordBlit(ID3D12Resource* backBuffer, UINT index, bool temporalOutpu
     transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 }
 
-void Host::WaitFenceValue(UINT64 value)
+bool Host::WaitFenceValue(UINT64 value)
 {
-    if (value == 0 || frameFence_->GetCompletedValue() >= value)
-        return;
-    frameFence_->SetEventOnCompletion(value, fenceEvent_);
-    WaitForSingleObject(fenceEvent_, 2000);
+    if (value == 0)
+        return true;
+    if (!frameFence_ || !fenceEvent_)
+        return false;
+    const UINT64 completed = frameFence_->GetCompletedValue();
+    if (completed == UINT64_MAX)
+        return false;
+    if (completed >= value)
+        return true;
+    if (FAILED(frameFence_->SetEventOnCompletion(value, fenceEvent_)))
+        return false;
+    return WaitForSingleObject(fenceEvent_, INFINITE) == WAIT_OBJECT_0;
 }
 
-void Host::WaitGpu()
+bool Host::WaitSharedFenceValue(UINT64 value)
+{
+    if (value == 0)
+        return true;
+    if (!fence12_ || !fenceEvent_)
+        return false;
+    const UINT64 completed = fence12_->GetCompletedValue();
+    if (completed == UINT64_MAX)
+        return false;
+    if (completed >= value)
+        return true;
+    if (FAILED(fence12_->SetEventOnCompletion(value, fenceEvent_)))
+        return false;
+    return WaitForSingleObject(fenceEvent_, INFINITE) == WAIT_OBJECT_0;
+}
+
+bool Host::WaitGpu()
 {
     if (!queue_ || !frameFence_)
-        return;
+        return false;
     ++frameFenceValue_;
-    queue_->Signal(frameFence_.Get(), frameFenceValue_);
-    WaitFenceValue(frameFenceValue_);
+    if (FAILED(queue_->Signal(frameFence_.Get(), frameFenceValue_)))
+        return false;
+    return WaitFenceValue(frameFenceValue_) && WaitSharedFenceValue(sharedFenceValue_);
 }
 
-bool Host::PresentFrame(ID3D11Texture2D* src)
+bool Host::PresentFrame(ID3D11Texture2D* src, long long sourceTimestamp100ns)
 {
     // 1) D3D11: copy the captured frame into the shared texture, then signal the shared fence.
+    if (sharedReleaseValue_ != 0)
+    {
+        const HRESULT waitResult = ctx11_4_->Wait(fence11_.Get(), sharedReleaseValue_);
+        if (FAILED(waitResult))
+        {
+            Log("D3D11 GPU release wait failed: 0x%08X", static_cast<unsigned>(waitResult));
+            return false;
+        }
+    }
     D3D11_BOX box{ static_cast<UINT>(cropX_), static_cast<UINT>(cropY_), 0, static_cast<UINT>(cropX_) + width_,
                    static_cast<UINT>(cropY_) + height_, 1 };
     Q11* q = nullptr;
@@ -1403,16 +1152,35 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
         q->pending = true;
     }
     ++sharedFenceValue_;
-    ctx11_4_->Signal(fence11_.Get(), sharedFenceValue_);
+    HRESULT hr = ctx11_4_->Signal(fence11_.Get(), sharedFenceValue_);
+    if (FAILED(hr))
+    {
+        Log("D3D11 producer fence signal failed: 0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
     ctx11_->Flush();
 
     // 2) D3D12: wait for that copy on the GPU, then copy into the back buffer and present.
-    queue_->Wait(fence12_.Get(), sharedFenceValue_);
+    hr = queue_->Wait(fence12_.Get(), sharedFenceValue_);
+    if (FAILED(hr))
+    {
+        Log("D3D12 producer fence wait failed: 0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
 
     const UINT bbIdx = swap_->GetCurrentBackBufferIndex();
     const UINT idx = bbIdx;
+    if (idx >= allocs_.size() || idx >= allocFence_.size())
+    {
+        Log("Swap chain returned out-of-range buffer index %u (buffer count %zu)", idx, allocs_.size());
+        return false;
+    }
     const auto tw0 = std::chrono::steady_clock::now();
-    WaitFenceValue(allocFence_[idx]);
+    if (!WaitFenceValue(allocFence_[idx]))
+    {
+        Log("Timed out or failed waiting for swap-chain allocator %u", idx);
+        return false;
+    }
     {
         const double w = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw0).count();
         waitMs_ += w;
@@ -1442,12 +1210,25 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
         }
     }
 
-    allocs_[idx]->Reset();
-    list_->Reset(allocs_[idx].Get(), nullptr);
+    HRESULT resetResult = allocs_[idx]->Reset();
+    if (FAILED(resetResult))
+    {
+        Log("Command allocator reset failed for buffer %u: 0x%08X", idx, static_cast<unsigned>(resetResult));
+        return false;
+    }
+    resetResult = list_->Reset(allocs_[idx].Get(), nullptr);
+    if (FAILED(resetResult))
+    {
+        Log("Command list reset failed for buffer %u: 0x%08X", idx, static_cast<unsigned>(resetResult));
+        return false;
+    }
     if (tsHeap_)
         list_->EndQuery(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, idx * 2);
 
-    const bool temporalOutput = blitReady_ && fsrReady_ && RecordFsrTemporal();
+    oc::FfxInputResources flowInputs{};
+    const bool temporalOutput = blitReady_ && ffxBridge_.Ready() &&
+                                opticalFlow_.Record(list_.Get(), shared12_.Get(), flowInputs) &&
+                                ffxBridge_.Dispatch(list_.Get(), flowInputs, sourceTimestamp100ns);
     if (scaleOn_ || temporalOutput)
     {
         RecordBlit(bb.Get(), idx, temporalOutput);
@@ -1474,13 +1255,26 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
         list_->EndQuery(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, idx * 2 + 1);
         list_->ResolveQueryData(tsHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, idx * 2, 2, tsRead_.Get(), static_cast<UINT64>(idx) * 16);
     }
-    list_->Close();
+    hr = list_->Close();
+    if (FAILED(hr))
+    {
+        Log("Command list close failed: 0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
     ID3D12CommandList* lists[] = { list_.Get() };
     queue_->ExecuteCommandLists(1, lists);
+    ++sharedFenceValue_;
+    hr = queue_->Signal(fence12_.Get(), sharedFenceValue_);
+    if (FAILED(hr))
+    {
+        Log("D3D12 shared-texture release signal failed: 0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
+    sharedReleaseValue_ = sharedFenceValue_;
     bb.Reset();
 
     const auto tp0 = std::chrono::steady_clock::now();
-    HRESULT hr = swap_->Present(0, 0);
+    hr = swap_->Present(0, 0);
     {
         const double p = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
         presentMs_ += p;
@@ -1494,7 +1288,12 @@ bool Host::PresentFrame(ID3D11Texture2D* src)
     }
 
     ++frameFenceValue_;
-    queue_->Signal(frameFence_.Get(), frameFenceValue_);
+    hr = queue_->Signal(frameFence_.Get(), frameFenceValue_);
+    if (FAILED(hr))
+    {
+        Log("Swap-chain allocator fence signal failed: 0x%08X", static_cast<unsigned>(hr));
+        return false;
+    }
     allocFence_[idx] = frameFenceValue_;
     return true;
 }
@@ -1577,7 +1376,18 @@ bool Host::ApplyGeometry(UINT capW, UINT capH)
     const bool outChanged = w != width_ || h != height_;
     Log("Geometry changed: capture %ux%u, showing %ux%u at crop (%d,%d)", capW, capH, w, h, cx, cy);
 
-    WaitGpu();
+    if (!WaitGpu())
+    {
+        Log("Could not complete the GPU queue before changing capture geometry");
+        return false;
+    }
+
+    const bool geometryChanged = capChanged || outChanged || cx != cropX_ || cy != cropY_;
+    if (geometryChanged)
+    {
+        opticalFlow_.ResetHistory();
+        ffxBridge_.ResetHistory();
+    }
 
     capW_ = capW;
     capH_ = capH;
@@ -1586,6 +1396,8 @@ bool Host::ApplyGeometry(UINT capW, UINT capH)
 
     if (outChanged)
     {
+        ffxBridge_.ReleaseContext();
+        opticalFlow_.Release();
         width_ = w;
         height_ = h;
         if (!scaleOn_)
@@ -1597,6 +1409,18 @@ bool Host::ApplyGeometry(UINT capW, UINT capH)
             {
                 Log("ResizeBuffers failed: 0x%08X", static_cast<unsigned>(hr));
                 return false;
+            }
+            DXGI_SWAP_CHAIN_DESC1 actualDesc{};
+            if (FAILED(swap_->GetDesc1(&actualDesc)) || actualDesc.BufferCount == 0)
+            {
+                Log("Swap chain returned an invalid buffer count after resize");
+                return false;
+            }
+            if (actualDesc.BufferCount != allocs_.size())
+            {
+                Log("Swap chain buffer count changed to %u after resize", actualDesc.BufferCount);
+                if (!CreateFrameResources(actualDesc.BufferCount))
+                    return false;
             }
         }
 
@@ -1626,15 +1450,8 @@ bool Host::RefreshGeometry()
     if (!ComputeCrop(capW_, capH_, cx, cy, w, h))
         return true;
 
-    if (w != width_ || h != height_)
+    if (w != width_ || h != height_ || cx != cropX_ || cy != cropY_)
         return ApplyGeometry(capW_, capH_);
-
-    if (cx != cropX_ || cy != cropY_)
-    {
-        cropX_ = cx;
-        cropY_ = cy;
-        lastBounds_ = {};
-    }
     return true;
 }
 
@@ -1835,13 +1652,14 @@ void Host::Shutdown()
     {
     }
 
-    WaitGpu();
-    ReleaseFsrTemporal();
-    if (ffxModule_)
+    if (queue_ && frameFence_ && fenceEvent_ && !WaitGpu())
     {
-        FreeLibrary(ffxModule_);
-        ffxModule_ = nullptr;
+        Log("Could not complete the GPU queue during shutdown; terminating before releasing live resources");
+        TerminateProcess(GetCurrentProcess(), ERROR_DEVICE_REMOVED);
+        return;
     }
+    ffxBridge_.Shutdown();
+    opticalFlow_.Release();
 
     UnregisterHotkeys();
     if (parentProc_)
@@ -1989,7 +1807,6 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
 {
     opt_ = opt;
     st_ = settings;
-    Log("Swap chain buffers: 3");
 
     {
         DEVMODEW dm{};
@@ -2244,12 +2061,13 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
             winrt::check_hresult(access->GetInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(tex.GetAddressOf())));
         }
 
+        const long long sourceTimestamp100ns = latest.SystemRelativeTime().count();
         {
             LARGE_INTEGER qpc{}, freq{};
             QueryPerformanceCounter(&qpc);
             QueryPerformanceFrequency(&freq);
             const double nowMs = 1000.0 * static_cast<double>(qpc.QuadPart) / static_cast<double>(freq.QuadPart);
-            const long long src = latest.SystemRelativeTime().count();
+            const long long src = sourceTimestamp100ns;
             const double age = nowMs - static_cast<double>(src) / 10000.0;
             if (latMs_.size() < 4096 && age > -500.0 && age < 2000.0)
                 latMs_.push_back(age + 500.0); // shifted so negative values survive the statistics; shown shifted back
@@ -2262,7 +2080,7 @@ int Host::Run(const Options& opt, const oc::Settings& settings)
         if (presLast_.time_since_epoch().count() != 0 && presGaps_.size() < 4096)
             presGaps_.push_back(std::chrono::duration<double, std::milli>(t0 - presLast_).count());
         presLast_ = t0;
-        if (!PresentFrame(tex.Get()))
+        if (!PresentFrame(tex.Get(), sourceTimestamp100ns))
             break;
         ++frames;
         ++liveFrames_;
