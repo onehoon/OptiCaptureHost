@@ -370,7 +370,13 @@ void App::Paint(HDC dc,int width,int height)
 LRESULT App::OnMessage(UINT m,WPARAM w,LPARAM l)
 {
     switch(m) {
-    case WM_PAINT: { PAINTSTRUCT ps{}; HDC dc=BeginPaint(hwnd_,&ps); RECT rc{}; GetClientRect(hwnd_,&rc); Paint(dc,rc.right,rc.bottom); EndPaint(hwnd_,&ps); return 0; }
+    case WM_PAINT: { PAINTSTRUCT ps{}; HDC dc=BeginPaint(hwnd_,&ps); RECT rc{}; GetClientRect(hwnd_,&rc);
+        const int width=rc.right-rc.left, height=rc.bottom-rc.top; HDC buffer=CreateCompatibleDC(dc);
+        HBITMAP bitmap=buffer?CreateCompatibleBitmap(dc,width,height):nullptr; HGDIOBJ previous=bitmap?SelectObject(buffer,bitmap):nullptr;
+        bool painted=false; if (buffer&&bitmap&&previous&&previous!=HGDI_ERROR) { Paint(buffer,width,height);
+            painted=BitBlt(dc,0,0,width,height,buffer,0,0,SRCCOPY)!=FALSE; SelectObject(buffer,previous); }
+        if (!painted) Paint(dc,width,height); if (bitmap) DeleteObject(bitmap); if (buffer) DeleteDC(buffer);
+        EndPaint(hwnd_,&ps); return 0; }
     case WM_ERASEBKGND: return 1;
     case WM_DPICHANGED: ApplyDpi(HIWORD(w),reinterpret_cast<const RECT*>(l)); return 0;
     case WM_TIMER: if (w==kTimerList&&!host_) Refresh(); else if (w==kTimerHost) PollHost(); return 0;
