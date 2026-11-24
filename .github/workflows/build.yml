@@ -1,11 +1,21 @@
 name: build
 
 on:
+  pull_request:
+    branches:
+      - feature/optiscaler-upstream
+      - refactor/upstream-provider-cleanup
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   windows:
+    name: Windows x64 Release
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -15,7 +25,21 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Package
+      - name: Verify executables
+        shell: pwsh
+        run: |
+          $required = @(
+            'build/Release/OptiCaptureHost.exe',
+            'build/Release/OptiCaptureLauncher.exe'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Build output is missing: $path"
+            }
+          }
+
+      - name: Package development ZIP
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force package/third_party/ffx | Out-Null
@@ -25,9 +49,29 @@ jobs:
           Copy-Item LICENSE package/
           Copy-Item NOTICE.md package/
           Copy-Item third_party/ffx/LICENSE.txt package/third_party/ffx/
+
+          $required = @(
+            'package/OptiCaptureHost.exe',
+            'package/OptiCaptureLauncher.exe',
+            'package/README.md',
+            'package/LICENSE',
+            'package/NOTICE.md',
+            'package/third_party/ffx/LICENSE.txt'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Package file is missing: $path"
+            }
+          }
+
           Compress-Archive -Path package/* -DestinationPath OptiCaptureHost-win64.zip -Force
+          if (-not (Test-Path -LiteralPath 'OptiCaptureHost-win64.zip' -PathType Leaf)) {
+            throw 'Development ZIP was not created.'
+          }
 
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
         with:
           name: OptiCaptureHost-win64
           path: OptiCaptureHost-win64.zip
+          retention-days: 3
